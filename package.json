@@ -1,6 +1,6 @@
 {
   "name": "emdash-mailing-list",
-  "version": "0.2.0",
+  "version": "0.2.1",
   "description": "A very simple mailing list for EmDash CMS — signup with double opt-in, unsubscribe, admin-composed mail blasts, and Postal webhook bounce handling",
   "type": "module",
   "main": "dist/index.mjs",

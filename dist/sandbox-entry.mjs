@@ -61,30 +61,63 @@ async function getCollections(ctx) {
 async function getCollection(ctx) {
 	return (await getCollections(ctx))[0];
 }
+function parseFilters(raw) {
+	const filters = /* @__PURE__ */ new Map();
+	for (const line of raw.split("\n")) {
+		const m = line.match(/^\s*([a-z][a-z0-9_]*)\s*:\s*(.+)$/i);
+		if (!m) continue;
+		const pairs = [];
+		for (const part of m[2].split(",")) {
+			const kv = part.match(/^\s*([a-zA-Z0-9_]+)\s*=\s*(.*?)\s*$/);
+			if (kv) pairs.push([kv[1], kv[2]]);
+		}
+		if (pairs.length) filters.set(m[1].toLowerCase(), pairs);
+	}
+	return filters;
+}
+function matchesFilter(data, pairs) {
+	if (!pairs) return true;
+	return pairs.every(([key, expected]) => {
+		const actual = data[key];
+		const exp = expected.toLowerCase();
+		if (exp === "true" || exp === "false") return Boolean(actual) === (exp === "true");
+		if (actual === void 0 || actual === null) return exp === "";
+		if (typeof actual === "number" && !Number.isNaN(Number(expected))) return actual === Number(expected);
+		return String(actual).toLowerCase() === exp;
+	});
+}
 /**
 * Recipient data from EXTRA source collections (e.g. an attendees list):
-* email → entry data, first occurrence wins. These entries only need an
-* `email` field; their other fields become merge tags.
+* email → entry data (+ _collection), first occurrence wins. These entries
+* only need an `email` field; their other fields become merge tags.
 */
-async function gatherExtraData(ctx) {
+async function gatherExtraData(ctx, filters) {
 	const [, ...extras] = await getCollections(ctx);
 	const map = /* @__PURE__ */ new Map();
 	const api = contentApi(ctx);
-	for (const collection of extras) try {
-		let cursor;
-		do {
-			const page = await api.list(collection, {
-				limit: 100,
-				cursor
-			});
-			for (const entry of page.items) {
-				const email = normalizeEmail(entry.data?.email);
-				if (email && !map.has(email)) map.set(email, entry.data);
-			}
-			cursor = page.hasMore ? page.cursor : void 0;
-		} while (cursor);
-	} catch (error) {
-		ctx.log.error(`Mailing list: cannot read source collection "${collection}"`, error);
+	for (const collection of extras) {
+		const pairs = filters?.get(collection.toLowerCase());
+		try {
+			let cursor;
+			do {
+				const page = await api.list(collection, {
+					limit: 100,
+					cursor
+				});
+				for (const entry of page.items) {
+					const email = normalizeEmail(entry.data?.email);
+					if (!email || map.has(email)) continue;
+					if (!matchesFilter(entry.data, pairs)) continue;
+					map.set(email, {
+						...entry.data,
+						_collection: collection
+					});
+				}
+				cursor = page.hasMore ? page.cursor : void 0;
+			} while (cursor);
+		} catch (error) {
+			ctx.log.error(`Mailing list: cannot read source collection "${collection}"`, error);
+		}
 	}
 	return map;
 }
@@ -159,6 +192,7 @@ async function upsertSubscriber(ctx, email, patch) {
 	const token = patch.token ?? randomToken();
 	const data = {
 		email,
+		title: email,
 		subscription: "pending",
 		blocked: false,
 		token,
@@ -340,14 +374,20 @@ async function processQueue(ctx) {
 		await blasts(ctx).put(blastId, blast);
 	}
 }
-async function enqueueBlast(ctx, subject, body) {
+async function enqueueBlast(ctx, subject, body, filtersRaw = "") {
 	const blastId = `blast_${Date.now()}_${randomToken().slice(0, 6)}`;
+	const filters = parseFilters(filtersRaw);
+	const primarySlug = (await getCollection(ctx)).toLowerCase();
 	const primary = await listAllSubscribers(ctx);
 	const byEmail = new Map(primary.map((e) => [e.data.email, e]));
-	const recipients = primary.filter((e) => e.data.subscription === "confirmed" && !e.data.blocked);
-	const extras = await gatherExtraData(ctx);
+	const recipients = primary.filter((e) => e.data.subscription === "confirmed" && !e.data.blocked && matchesFilter(e.data, filters.get(primarySlug)));
+	const extras = await gatherExtraData(ctx, filters);
 	for (const [email, data] of extras) {
-		if (byEmail.has(email)) continue;
+		const existing = byEmail.get(email);
+		if (existing) {
+			if (existing.data.subscription === "confirmed" && !existing.data.blocked && !recipients.includes(existing)) recipients.push(existing);
+			continue;
+		}
 		try {
 			const entry = await upsertSubscriber(ctx, email, {
 				subscription: "confirmed",
@@ -371,6 +411,7 @@ async function enqueueBlast(ctx, subject, body) {
 	await blasts(ctx).put(blastId, {
 		subject,
 		body,
+		filters: filtersRaw || void 0,
 		status: "sending",
 		total: recipients.length,
 		sent: 0,
@@ -521,7 +562,7 @@ async function buildAdminPage(ctx) {
 		return [
 			{
 				type: "section",
-				text: `**${d.email}** — ${flags}`
+				text: `${d.email} — ${flags}`
 			},
 			{
 				type: "actions",
@@ -584,6 +625,13 @@ async function buildAdminPage(ctx) {
 					action_id: "body",
 					label: "Message (Markdown)",
 					multiline: true
+				},
+				{
+					type: "text_input",
+					action_id: "filters",
+					label: "Recipient filter (optional) — one line per collection, e.g. “attendees: year=2026, void=false”. Unlisted collections are unfiltered.",
+					multiline: true,
+					placeholder: "attendees: year=2026, void=false"
 				},
 				{
 					type: "text_input",
@@ -935,7 +983,7 @@ var sandbox_entry_default = definePlugin({
 						return adminWithToast(ctx, `Test sent to ${testTo}`, "success");
 					}
 					await ensureCron(ctx);
-					const { total } = await enqueueBlast(ctx, subject, body);
+					const { total } = await enqueueBlast(ctx, subject, body, typeof values.filters === "string" ? values.filters : "");
 					if (total === 0) return adminWithToast(ctx, "No sendable subscribers", "error");
 					return adminWithToast(ctx, `Blast queued to ${total} subscribers — sending starts within a minute`, "success");
 				} catch (error) {

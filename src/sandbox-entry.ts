@@ -46,6 +46,7 @@ interface SubscriberEntry {
 interface Blast {
 	subject: string;
 	body: string;
+	filters?: string;
 	status: "sending" | "sent";
 	total: number;
 	sent: number;
@@ -128,22 +129,63 @@ async function getCollection(ctx: PluginContext): Promise<string> {
 }
 
 /**
- * Recipient data from EXTRA source collections (e.g. an attendees list):
- * email → entry data, first occurrence wins. These entries only need an
- * `email` field; their other fields become merge tags.
+ * Collection-scoped recipient filters, one per line:
+ *   attendees: year=2026, void=false
+ * Comma-separated pairs are ANDed. Values compare as booleans ("true"/"false"),
+ * numbers, or case-insensitive strings. A collection with no line is unfiltered.
  */
-async function gatherExtraData(ctx: PluginContext): Promise<Map<string, Record<string, unknown>>> {
+type RecipientFilters = Map<string, Array<[string, string]>>;
+
+function parseFilters(raw: string): RecipientFilters {
+	const filters: RecipientFilters = new Map();
+	for (const line of raw.split("\n")) {
+		const m = line.match(/^\s*([a-z][a-z0-9_]*)\s*:\s*(.+)$/i);
+		if (!m) continue;
+		const pairs: Array<[string, string]> = [];
+		for (const part of m[2].split(",")) {
+			const kv = part.match(/^\s*([a-zA-Z0-9_]+)\s*=\s*(.*?)\s*$/);
+			if (kv) pairs.push([kv[1], kv[2]]);
+		}
+		if (pairs.length) filters.set(m[1].toLowerCase(), pairs);
+	}
+	return filters;
+}
+
+function matchesFilter(data: Record<string, unknown>, pairs: Array<[string, string]> | undefined): boolean {
+	if (!pairs) return true;
+	return pairs.every(([key, expected]) => {
+		const actual = data[key];
+		const exp = expected.toLowerCase();
+		if (exp === "true" || exp === "false") return Boolean(actual) === (exp === "true");
+		if (actual === undefined || actual === null) return exp === "";
+		if (typeof actual === "number" && !Number.isNaN(Number(expected))) return actual === Number(expected);
+		return String(actual).toLowerCase() === exp;
+	});
+}
+
+/**
+ * Recipient data from EXTRA source collections (e.g. an attendees list):
+ * email → entry data (+ _collection), first occurrence wins. These entries
+ * only need an `email` field; their other fields become merge tags.
+ */
+async function gatherExtraData(
+	ctx: PluginContext,
+	filters?: RecipientFilters,
+): Promise<Map<string, Record<string, unknown>>> {
 	const [, ...extras] = await getCollections(ctx);
 	const map = new Map<string, Record<string, unknown>>();
 	const api = contentApi(ctx);
 	for (const collection of extras) {
+		const pairs = filters?.get(collection.toLowerCase());
 		try {
 			let cursor: string | undefined;
 			do {
 				const page = await api.list(collection, { limit: 100, cursor });
 				for (const entry of page.items) {
 					const email = normalizeEmail(entry.data?.email);
-					if (email && !map.has(email)) map.set(email, entry.data as Record<string, unknown>);
+					if (!email || map.has(email)) continue;
+					if (!matchesFilter(entry.data as Record<string, unknown>, pairs)) continue;
+					map.set(email, { ...(entry.data as Record<string, unknown>), _collection: collection });
 				}
 				cursor = page.hasMore ? page.cursor : undefined;
 			} while (cursor);
@@ -262,6 +304,7 @@ async function upsertSubscriber(
 	const token = (patch.token as string) ?? randomToken();
 	const data: SubscriberData = {
 		email,
+		title: email, // readable entry title in the admin content list
 		subscription: "pending",
 		blocked: false,
 		token,
@@ -477,18 +520,42 @@ async function processQueue(ctx: PluginContext): Promise<void> {
 	}
 }
 
-async function enqueueBlast(ctx: PluginContext, subject: string, body: string): Promise<{ blastId: string; total: number }> {
+async function enqueueBlast(
+	ctx: PluginContext,
+	subject: string,
+	body: string,
+	filtersRaw = "",
+): Promise<{ blastId: string; total: number }> {
 	const blastId = `blast_${Date.now()}_${randomToken().slice(0, 6)}`;
+	const filters = parseFilters(filtersRaw);
+	const primarySlug = (await getCollection(ctx)).toLowerCase();
 	const primary = await listAllSubscribers(ctx);
 	const byEmail = new Map(primary.map((e) => [e.data.email, e]));
-	const recipients = primary.filter((e) => e.data.subscription === "confirmed" && !e.data.blocked);
+	const recipients = primary.filter(
+		(e) =>
+			e.data.subscription === "confirmed" &&
+			!e.data.blocked &&
+			matchesFilter(e.data as Record<string, unknown>, filters.get(primarySlug)),
+	);
 	// Extra source collections (e.g. attendees): anyone with an email and no
 	// primary record gets materialized as a confirmed subscriber (with a real
 	// unsubscribe token). Existing primary records govern — unsubscribed or
 	// blocked addresses are never re-added.
-	const extras = await gatherExtraData(ctx);
+	const extras = await gatherExtraData(ctx, filters);
 	for (const [email, data] of extras) {
-		if (byEmail.has(email)) continue;
+		const existing = byEmail.get(email);
+		if (existing) {
+			// Already in the primary list. If the primary filter excluded them but
+			// a filtered extra source includes them, add them (suppression wins).
+			if (
+				existing.data.subscription === "confirmed" &&
+				!existing.data.blocked &&
+				!recipients.includes(existing)
+			) {
+				recipients.push(existing);
+			}
+			continue;
+		}
 		try {
 			const entry = await upsertSubscriber(ctx, email, {
 				subscription: "confirmed",
@@ -511,6 +578,7 @@ async function enqueueBlast(ctx: PluginContext, subject: string, body: string): 
 	await blasts(ctx).put(blastId, {
 		subject,
 		body,
+		filters: filtersRaw || undefined,
 		status: "sending",
 		total: recipients.length,
 		sent: 0,
@@ -662,7 +730,7 @@ async function buildAdminPage(ctx: PluginContext): Promise<Record<string, unknow
 			},
 		});
 		return [
-			{ type: "section", text: `**${d.email}** — ${flags}` },
+			{ type: "section", text: `${d.email} — ${flags}` },
 			{ type: "actions", elements: buttons },
 			{ type: "divider" },
 		];
@@ -696,6 +764,13 @@ async function buildAdminPage(ctx: PluginContext): Promise<Record<string, unknow
 				fields: [
 					{ type: "text_input", action_id: "subject", label: "Subject" },
 					{ type: "text_input", action_id: "body", label: "Message (Markdown)", multiline: true },
+					{
+						type: "text_input",
+						action_id: "filters",
+						label: "Recipient filter (optional) — one line per collection, e.g. “attendees: year=2026, void=false”. Unlisted collections are unfiltered.",
+						multiline: true,
+						placeholder: "attendees: year=2026, void=false",
+					},
 					{
 						type: "text_input",
 						action_id: "test_to",
@@ -994,7 +1069,8 @@ export default definePlugin({
 							return adminWithToast(ctx, `Test sent to ${testTo}`, "success");
 						}
 						await ensureCron(ctx);
-						const { total } = await enqueueBlast(ctx, subject, body);
+						const filtersRaw = typeof values.filters === "string" ? values.filters : "";
+						const { total } = await enqueueBlast(ctx, subject, body, filtersRaw);
 						if (total === 0) return adminWithToast(ctx, "No sendable subscribers", "error");
 						return adminWithToast(ctx, `Blast queued to ${total} subscribers — sending starts within a minute`, "success");
 					} catch (error) {
