@@ -1,0 +1,52 @@
+{
+  "name": "emdash-mailing-list",
+  "version": "0.1.0",
+  "description": "A very simple mailing list for EmDash CMS — signup with double opt-in, unsubscribe, admin-composed mail blasts, and Postal webhook bounce handling",
+  "type": "module",
+  "main": "dist/index.mjs",
+  "exports": {
+    ".": {
+      "import": "./dist/index.mjs",
+      "types": "./dist/index.d.mts"
+    },
+    "./sandbox": "./dist/sandbox-entry.mjs"
+  },
+  "files": [
+    "dist"
+  ],
+  "keywords": [
+    "emdash",
+    "cms",
+    "plugin",
+    "mailing-list",
+    "newsletter",
+    "email",
+    "postal"
+  ],
+  "author": "Woofy <https://chateauwoofy.com>",
+  "license": "MIT",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/WoofyIO/emdash-mailing-list.git"
+  },
+  "bugs": {
+    "url": "https://github.com/WoofyIO/emdash-mailing-list/issues"
+  },
+  "homepage": "https://github.com/WoofyIO/emdash-mailing-list#readme",
+  "peerDependencies": {
+    "emdash": ">=0.32.0"
+  },
+  "devDependencies": {
+    "@types/node": "^22.0.0",
+    "emdash": "^0.32.0",
+    "tsdown": "^0.21.7",
+    "typescript": "^5.5.0"
+  },
+  "scripts": {
+    "build": "tsdown src/index.ts src/sandbox-entry.ts --format esm --dts --clean",
+    "dev": "tsdown src/index.ts src/sandbox-entry.ts --format esm --dts --watch",
+    "typecheck": "tsc --noEmit",
+    "prepare": "npm run build",
+    "prepublishOnly": "npm run build"
+  }
+}
