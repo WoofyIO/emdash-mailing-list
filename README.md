@@ -8,7 +8,9 @@ Email is delivered through whatever email provider the site already has configur
 
 **Subscribers are regular CMS content entries** in a `subscribers` collection — browse and edit them under **Content**, and extend the schema with your own fields (`is_wine_club_member`, `first_name`, …) in the admin schema editor. Every field is available as a `{{merge_tag}}` in blast subjects and bodies.
 
-Minimum fields (see the seed snippet below): `email` (string), `subscription` (string: `pending`/`confirmed`/`unsubscribed`), `blocked` (boolean), `token` (string), `soft_fails` (integer), `bounce_reason` (string), `source` (string).
+Minimum fields (see the seed snippet below): `email` (string), `title` (string — maintained by the plugin as `email — state` for a readable content list), `subscription` (string: `pending`/`confirmed`/`unsubscribed`), `blocked` (boolean), `token` (string), `soft_fails` (integer), `bounce_reason` (string), `source` (string).
+
+> Entry draft/published status can't be set through the plugin content API (system columns are protected), so the plugin ignores it — `subscription` is the source of truth, mirrored into the title.
 
 ### Multiple source collections
 
@@ -25,6 +27,7 @@ The **Source collections** setting takes a comma-separated list. The first is th
 - **Double opt-in** — subscribers confirm via an emailed link before receiving blasts
 - **Unsubscribe** — tokenized one-click link appended to every blast automatically
 - **Blasts** — Markdown compose (`**bold**`, `*italic*`, `[links](…)`, `#` headings, `-` lists), `{{merge_tags}}`, queued and sent in rate-limited batches with live sent/delivered/failed/bounced counts
+- **Targeting** — per-collection recipient filters at compose time (`attendees: year=2026, void=false` — works on the subscribers list too), an include/exclude toggle for the primary list, and an **Evaluate** mode that shows exactly who would receive the blast (email, source, state) without sending anything
 - **HTML template** — paste your site's email shell in settings; `{{content}}` receives the rendered message (also available: `{{subject}}`, `{{unsubscribe_url}}`, `{{list_name}}`). Leave empty for a clean default.
 - **Subscriber management** — per-row **Confirm / Block / Unblock / Delete** actions in the admin, plus manual add
 - **Bounce handling** — Postal webhook: hard bounces **block** the address (kept on the list for audit, never emailed), three soft failures do the same, `MessageSent` upgrades sends to *delivered*. Blocking is reversible with one click.

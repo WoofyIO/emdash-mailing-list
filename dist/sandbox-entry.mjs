@@ -184,21 +184,36 @@ async function findByToken(ctx, token) {
 	if (match) await ctx.kv.set(`tok:${token}`, match.id);
 	return match;
 }
+/** Title mirrors state so the admin Content list reads at a glance. */
+function subscriberTitle(d) {
+	if (d.blocked) return `${d.email} — blocked`;
+	if (d.subscription !== "confirmed") return `${d.email} — ${d.subscription}`;
+	return d.email;
+}
 async function upsertSubscriber(ctx, email, patch) {
 	const collection = await getCollection(ctx);
 	const api = contentApi(ctx);
 	const existing = await findByEmail(ctx, email);
-	if (existing) return api.update(collection, existing.id, { ...patch });
+	if (existing) {
+		const merged = {
+			...existing.data,
+			...patch
+		};
+		return api.update(collection, existing.id, {
+			...patch,
+			title: subscriberTitle(merged)
+		});
+	}
 	const token = patch.token ?? randomToken();
 	const data = {
 		email,
-		title: email,
 		subscription: "pending",
 		blocked: false,
 		token,
 		soft_fails: 0,
 		...patch
 	};
+	data.title = subscriberTitle(data);
 	const entry = await api.create(collection, { ...data });
 	await ctx.kv.set(`tok:${token}`, entry.id);
 	return entry;
@@ -374,29 +389,64 @@ async function processQueue(ctx) {
 		await blasts(ctx).put(blastId, blast);
 	}
 }
-async function enqueueBlast(ctx, subject, body, filtersRaw = "") {
-	const blastId = `blast_${Date.now()}_${randomToken().slice(0, 6)}`;
+/**
+* Compute the recipient set for a blast: primary-list members (optional,
+* filterable) plus filtered extra-source entries. Unsubscribed/blocked
+* addresses are excluded everywhere. Pure — no writes.
+*/
+async function resolveRecipients(ctx, filtersRaw, includePrimary) {
 	const filters = parseFilters(filtersRaw);
 	const primarySlug = (await getCollection(ctx)).toLowerCase();
 	const primary = await listAllSubscribers(ctx);
 	const byEmail = new Map(primary.map((e) => [e.data.email, e]));
-	const recipients = primary.filter((e) => e.data.subscription === "confirmed" && !e.data.blocked && matchesFilter(e.data, filters.get(primarySlug)));
+	const chosen = /* @__PURE__ */ new Map();
+	if (includePrimary) for (const e of primary) {
+		if (e.data.subscription !== "confirmed" || e.data.blocked) continue;
+		if (!matchesFilter(e.data, filters.get(primarySlug))) continue;
+		chosen.set(e.data.email, {
+			email: e.data.email,
+			source: primarySlug,
+			state: "confirmed",
+			entry: e
+		});
+	}
 	const extras = await gatherExtraData(ctx, filters);
 	for (const [email, data] of extras) {
+		if (chosen.has(email)) continue;
+		const source = typeof data._collection === "string" ? data._collection : "import";
 		const existing = byEmail.get(email);
 		if (existing) {
-			if (existing.data.subscription === "confirmed" && !existing.data.blocked && !recipients.includes(existing)) recipients.push(existing);
+			if (existing.data.subscription === "unsubscribed" || existing.data.blocked) continue;
+			chosen.set(email, {
+				email,
+				source,
+				state: existing.data.subscription,
+				entry: existing
+			});
+		} else chosen.set(email, {
+			email,
+			source,
+			state: "new"
+		});
+	}
+	return [...chosen.values()];
+}
+async function enqueueBlast(ctx, subject, body, filtersRaw = "", includePrimary = true) {
+	const blastId = `blast_${Date.now()}_${randomToken().slice(0, 6)}`;
+	const resolved = await resolveRecipients(ctx, filtersRaw, includePrimary);
+	const recipients = [];
+	for (const r of resolved) {
+		if (r.entry) {
+			recipients.push(r.entry);
 			continue;
 		}
 		try {
-			const entry = await upsertSubscriber(ctx, email, {
+			recipients.push(await upsertSubscriber(ctx, r.email, {
 				subscription: "confirmed",
-				source: typeof data._collection === "string" ? data._collection : "import"
-			});
-			recipients.push(entry);
-			byEmail.set(email, entry);
+				source: r.source
+			}));
 		} catch (error) {
-			ctx.log.error(`Mailing list: failed to materialize ${email}`, error);
+			ctx.log.error(`Mailing list: failed to materialize ${r.email}`, error);
 		}
 	}
 	if (recipients.length > 0) await sendsStore(ctx).putMany(recipients.map((e) => ({
@@ -412,6 +462,7 @@ async function enqueueBlast(ctx, subject, body, filtersRaw = "") {
 		subject,
 		body,
 		filters: filtersRaw || void 0,
+		includePrimary,
 		status: "sending",
 		total: recipients.length,
 		sent: 0,
@@ -487,7 +538,7 @@ async function handlePostalEvent(ctx, event, payload) {
 		default: return `ignored: ${event}`;
 	}
 }
-async function buildAdminPage(ctx) {
+async function buildAdminPage(ctx, preview) {
 	const available = await collectionAvailable(ctx);
 	const collection = await getCollection(ctx);
 	if (!available) return { blocks: [{
@@ -627,11 +678,23 @@ async function buildAdminPage(ctx) {
 					multiline: true
 				},
 				{
+					type: "toggle",
+					action_id: "include_primary",
+					label: "Include the subscribers list (untick to target only the extra source collections)",
+					initial_value: true
+				},
+				{
 					type: "text_input",
 					action_id: "filters",
-					label: "Recipient filter (optional) — one line per collection, e.g. “attendees: year=2026, void=false”. Unlisted collections are unfiltered.",
+					label: "Recipient filter (optional) — one line per collection, e.g. “attendees: year=2026, void=false”. Works for the subscribers list too. Unlisted collections are unfiltered.",
 					multiline: true,
 					placeholder: "attendees: year=2026, void=false"
+				},
+				{
+					type: "toggle",
+					action_id: "preview",
+					label: "Evaluate only — show who would receive it, without sending",
+					initial_value: false
 				},
 				{
 					type: "text_input",
@@ -641,10 +704,46 @@ async function buildAdminPage(ctx) {
 				}
 			],
 			submit: {
-				label: "Send",
+				label: "Send / Evaluate",
 				action_id: "send_blast"
 			}
 		},
+		...preview ? [
+			{
+				type: "banner",
+				title: `Evaluation: ${preview.recipients.length} recipients`,
+				description: `Filters: ${preview.filtersRaw.trim() || "(none)"} · Subscribers list ${preview.includePrimary ? "included" : "excluded"}. Nothing was sent.`,
+				variant: "default"
+			},
+			{
+				type: "table",
+				page_action_id: "preview_page",
+				empty_text: "No one matches — nothing would be sent.",
+				columns: [
+					{
+						key: "email",
+						label: "Email"
+					},
+					{
+						key: "source",
+						label: "Source"
+					},
+					{
+						key: "state",
+						label: "State"
+					}
+				],
+				rows: preview.recipients.slice(0, 100).map((r) => ({
+					email: r.email,
+					source: r.source,
+					state: r.state === "new" ? "new (will be added to subscribers)" : r.state
+				}))
+			},
+			...preview.recipients.length > 100 ? [{
+				type: "context",
+				text: `…and ${preview.recipients.length - 100} more.`
+			}] : []
+		] : [],
 		{
 			type: "header",
 			text: "Blasts"
@@ -963,6 +1062,24 @@ var sandbox_entry_default = definePlugin({
 				const subject = typeof values.subject === "string" ? values.subject.trim() : "";
 				const body = typeof values.body === "string" ? values.body.trim() : "";
 				const testTo = normalizeEmail(values.test_to);
+				const filtersRaw = typeof values.filters === "string" ? values.filters : "";
+				const includePrimary = values.include_primary !== false;
+				if (values.preview === true) try {
+					const recipients = await resolveRecipients(ctx, filtersRaw, includePrimary);
+					return {
+						...await buildAdminPage(ctx, {
+							recipients,
+							filtersRaw,
+							includePrimary
+						}),
+						toast: {
+							message: `${recipients.length} recipients match — nothing sent`,
+							type: "info"
+						}
+					};
+				} catch (error) {
+					return adminWithToast(ctx, `Error: ${error instanceof Error ? error.message : String(error)}`, "error");
+				}
 				if (!subject || !body) return adminWithToast(ctx, "Subject and message are required", "error");
 				try {
 					if (testTo) {
@@ -983,7 +1100,7 @@ var sandbox_entry_default = definePlugin({
 						return adminWithToast(ctx, `Test sent to ${testTo}`, "success");
 					}
 					await ensureCron(ctx);
-					const { total } = await enqueueBlast(ctx, subject, body, typeof values.filters === "string" ? values.filters : "");
+					const { total } = await enqueueBlast(ctx, subject, body, filtersRaw, includePrimary);
 					if (total === 0) return adminWithToast(ctx, "No sendable subscribers", "error");
 					return adminWithToast(ctx, `Blast queued to ${total} subscribers — sending starts within a minute`, "success");
 				} catch (error) {
