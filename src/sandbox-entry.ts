@@ -1,41 +1,46 @@
 /**
- * Runtime entry for the emdash-mailing-list plugin.
+ * Runtime entry for the emdash-mailing-list plugin (v0.2).
  *
- * Data model (plugin storage, scoped to this plugin):
- * - subscribers — id = lowercased email. { email, status, token, softFails,
- *   createdAt, confirmedAt?, unsubscribedAt?, bounceReason? }
- *   status: pending | confirmed | unsubscribed | bounced
- * - blasts — { subject, body, status, total, sent, delivered, failed,
- *   bounced, createdAt, completedAt? }   status: sending | sent
- * - sends — id = `${blastId}:${email}`. { blastId, email, status, error?,
- *   createdAt, sentAt? }   status: queued | sent | delivered | failed | bounced
+ * Subscribers are regular CMS content entries in a `subscribers` collection
+ * (configurable via KV `settings:collection`), so admins can browse them under
+ * Content, extend the schema with custom fields (e.g. `is_wine_club_member`),
+ * and use any field as a {{merge_tag}} in blasts. Minimum fields:
+ *   email (string), status (string: pending|confirmed|unsubscribed),
+ *   blocked (boolean), token (string), soft_fails (integer),
+ *   bounce_reason (string)
  *
- * KV:
- * - settings:listName   — human name used in emails ("the Chateau Woofy list")
- * - settings:batchSize  — sends per cron tick (default 25)
- * - settings:redirect   — path to redirect to after confirm/unsubscribe ("/")
- * - state:origin        — site origin, captured from incoming requests
- * - state:webhookSecret — random secret for the Postal webhook URL
+ * Plugin storage keeps the machinery: blasts + per-recipient sends.
+ * KV keeps settings, the site origin, the webhook secret, and a
+ * token → entry-slug index (`tok:<token>`).
+ *
+ * Blast bodies are Markdown; sends render them to HTML inside an admin-editable
+ * HTML template (KV `settings:template`, `{{content}}`/`{{subject}}`/
+ * `{{unsubscribe_url}}` placeholders) with a plain-text alternative.
  */
 import { definePlugin } from "emdash";
 import type { PluginContext } from "emdash";
 
-// ————————————————————————————————— helpers —————————————————————————————————
+// ————————————————————————————————— types ———————————————————————————————————
 
 /** Route handler context: PluginContext plus the request-scoped fields. */
 type RC = PluginContext & { input: unknown; request: Request };
 
 const EMAIL_RE = /^[^\s@]+@[^\s@]+\.[^\s@]+$/;
 
-interface Subscriber {
+interface SubscriberData {
 	email: string;
-	status: "pending" | "confirmed" | "unsubscribed" | "bounced";
+	subscription: "pending" | "confirmed" | "unsubscribed";
+	blocked: boolean;
 	token: string;
-	softFails: number;
-	createdAt: string;
-	confirmedAt?: string;
-	unsubscribedAt?: string;
-	bounceReason?: string;
+	soft_fails: number;
+	bounce_reason?: string;
+	[key: string]: unknown; // admin-added custom fields (merge tags)
+}
+
+interface SubscriberEntry {
+	id: string;
+	slug: string | null;
+	data: SubscriberData;
 }
 
 interface Blast {
@@ -59,6 +64,8 @@ interface Send {
 	createdAt: string;
 	sentAt?: string;
 }
+
+// ————————————————————————————————— helpers —————————————————————————————————
 
 function now(): string {
 	return new Date().toISOString();
@@ -90,25 +97,6 @@ async function getOrigin(ctx: PluginContext): Promise<string> {
 	return (await ctx.kv.get<string>("state:origin")) ?? "";
 }
 
-function routeUrl(origin: string, route: string, params: Record<string, string>): string {
-	const qs = new URLSearchParams(params).toString();
-	return `${origin}/_emdash/api/plugins/emdash-mailing-list/${route}?${qs}`;
-}
-
-async function ensureCron(ctx: PluginContext): Promise<void> {
-	// Trusted plugins registered in astro.config never fire plugin:activate,
-	// so make queue scheduling lazy and idempotent.
-	try {
-		const existing = await ctx.cron?.list();
-		if (!existing?.some((t: { name?: string; taskName?: string }) => (t.name ?? t.taskName) === "process-queue")) {
-			await ctx.cron?.schedule("process-queue", { schedule: "* * * * *" });
-			ctx.log.info("Mailing list send queue scheduled");
-		}
-	} catch (error) {
-		ctx.log.error("Failed to schedule send queue", error);
-	}
-}
-
 async function getWebhookSecret(ctx: PluginContext): Promise<string> {
 	let secret = await ctx.kv.get<string>("state:webhookSecret");
 	if (!secret) {
@@ -122,20 +110,65 @@ async function getListName(ctx: PluginContext): Promise<string> {
 	return (await ctx.kv.get<string>("settings:listName")) ?? "our mailing list";
 }
 
+/** Source collections; first is the primary list where signups/suppression live. */
+async function getCollections(ctx: PluginContext): Promise<string[]> {
+	const raw =
+		(await ctx.kv.get<string>("settings:collections")) ??
+		(await ctx.kv.get<string>("settings:collection")) ??
+		"subscribers";
+	const slugs = raw
+		.split(",")
+		.map((s) => s.trim())
+		.filter(Boolean);
+	return slugs.length > 0 ? slugs : ["subscribers"];
+}
+
+async function getCollection(ctx: PluginContext): Promise<string> {
+	return (await getCollections(ctx))[0];
+}
+
+/**
+ * Recipient data from EXTRA source collections (e.g. an attendees list):
+ * email → entry data, first occurrence wins. These entries only need an
+ * `email` field; their other fields become merge tags.
+ */
+async function gatherExtraData(ctx: PluginContext): Promise<Map<string, Record<string, unknown>>> {
+	const [, ...extras] = await getCollections(ctx);
+	const map = new Map<string, Record<string, unknown>>();
+	const api = contentApi(ctx);
+	for (const collection of extras) {
+		try {
+			let cursor: string | undefined;
+			do {
+				const page = await api.list(collection, { limit: 100, cursor });
+				for (const entry of page.items) {
+					const email = normalizeEmail(entry.data?.email);
+					if (email && !map.has(email)) map.set(email, entry.data as Record<string, unknown>);
+				}
+				cursor = page.hasMore ? page.cursor : undefined;
+			} while (cursor);
+		} catch (error) {
+			ctx.log.error(`Mailing list: cannot read source collection "${collection}"`, error);
+		}
+	}
+	return map;
+}
+
 async function pagePath(ctx: PluginContext, kind: "confirm" | "unsubscribe"): Promise<string> {
 	const key = kind === "confirm" ? "settings:confirmPath" : "settings:unsubscribePath";
 	return (await ctx.kv.get<string>(key)) ?? `/mailing/${kind}`;
 }
 
-function subscribers(ctx: PluginContext) {
-	return ctx.storage.subscribers! as unknown as {
-		get(id: string): Promise<Subscriber | null>;
-		put(id: string, data: Subscriber): Promise<void>;
-		delete(id: string): Promise<boolean>;
-		putMany(items: Array<{ id: string; data: Subscriber }>): Promise<void>;
-		query(o?: object): Promise<{ items: Array<{ id: string; data: Subscriber }>; cursor?: string; hasMore: boolean }>;
-		count(where?: object): Promise<number>;
-	};
+async function ensureCron(ctx: PluginContext): Promise<void> {
+	try {
+		const existing = await ctx.cron?.list();
+		if (!existing?.some((t: { name?: string; taskName?: string }) => (t.name ?? t.taskName) === "process-queue")) {
+			await ctx.cron?.schedule("process-queue", { schedule: "* * * * *" });
+			ctx.log.info("Mailing list send queue scheduled");
+		}
+	} catch (error) {
+		ctx.log.error("Failed to schedule send queue", error);
+	}
 }
 
 function blasts(ctx: PluginContext) {
@@ -156,17 +189,121 @@ function sendsStore(ctx: PluginContext) {
 	};
 }
 
-// ————————————————————————————— email composition ————————————————————————————
+// ———————————————————————— subscriber content store —————————————————————————
 
-function withFooter(body: string, listName: string, unsubscribeUrl: string): { text: string; html: string } {
-	const text = `${body}\n\n—\nYou're receiving this because you subscribed to ${listName}.\nUnsubscribe: ${unsubscribeUrl}`;
-	const paragraphs = body
-		.split(/\n{2,}/)
-		.map((p) => `<p>${escapeHtml(p).replace(/\n/g, "<br>")}</p>`)
-		.join("\n");
-	const html = `${paragraphs}\n<hr style="border:none;border-top:1px solid #ddd;margin:24px 0">\n<p style="font-size:12px;color:#777">You're receiving this because you subscribed to ${escapeHtml(listName)}. <a href="${unsubscribeUrl}">Unsubscribe</a></p>`;
-	return { text, html };
+function contentApi(ctx: PluginContext) {
+	if (!ctx.content) throw new Error("Missing content capability");
+	return ctx.content as unknown as {
+		get(collection: string, id: string): Promise<SubscriberEntry | null>;
+		list(
+			collection: string,
+			options?: object,
+		): Promise<{ items: SubscriberEntry[]; cursor?: string; hasMore: boolean }>;
+		create(collection: string, data: object): Promise<SubscriberEntry>;
+		update(collection: string, id: string, data: object): Promise<SubscriberEntry>;
+		delete(collection: string, id: string): Promise<boolean>;
+	};
 }
+
+/** Whether the subscribers collection exists (plugin degrades politely if not). */
+async function collectionAvailable(ctx: PluginContext): Promise<boolean> {
+	try {
+		await contentApi(ctx).list(await getCollection(ctx), { limit: 1 });
+		return true;
+	} catch {
+		return false;
+	}
+}
+
+async function listAllSubscribers(ctx: PluginContext): Promise<SubscriberEntry[]> {
+	const collection = await getCollection(ctx);
+	const api = contentApi(ctx);
+	const all: SubscriberEntry[] = [];
+	let cursor: string | undefined;
+	do {
+		const page = await api.list(collection, { limit: 100, cursor });
+		all.push(...page.items.filter((e) => typeof e.data?.email === "string"));
+		cursor = page.hasMore ? page.cursor : undefined;
+	} while (cursor && all.length < 10_000);
+	return all;
+}
+
+async function findByEmail(ctx: PluginContext, email: string): Promise<SubscriberEntry | null> {
+	const all = await listAllSubscribers(ctx);
+	return all.find((e) => e.data.email === email) ?? null;
+}
+
+async function findByToken(ctx: PluginContext, token: string): Promise<SubscriberEntry | null> {
+	if (!token) return null;
+	const collection = await getCollection(ctx);
+	const knownId = await ctx.kv.get<string>(`tok:${token}`);
+	if (knownId) {
+		const entry = await contentApi(ctx).get(collection, knownId).catch(() => null);
+		if (entry?.data?.token === token) return entry;
+	}
+	const all = await listAllSubscribers(ctx);
+	const match = all.find((e) => e.data.token === token) ?? null;
+	if (match) await ctx.kv.set(`tok:${token}`, match.id);
+	return match;
+}
+
+async function upsertSubscriber(
+	ctx: PluginContext,
+	email: string,
+	patch: Partial<SubscriberData>,
+): Promise<SubscriberEntry> {
+	const collection = await getCollection(ctx);
+	const api = contentApi(ctx);
+	const existing = await findByEmail(ctx, email);
+	if (existing) {
+		// Plugin write input is flat field values; only pass the changed fields.
+		return api.update(collection, existing.id, { ...patch });
+	}
+	const token = (patch.token as string) ?? randomToken();
+	const data: SubscriberData = {
+		email,
+		subscription: "pending",
+		blocked: false,
+		token,
+		soft_fails: 0,
+		...patch,
+	};
+	const entry = await api.create(collection, { ...data });
+	await ctx.kv.set(`tok:${token}`, entry.id);
+	return entry;
+}
+
+/** One-time migration from v0.1 plugin-storage subscribers to the collection. */
+async function migrateLegacySubscribers(ctx: PluginContext): Promise<void> {
+	const legacy = ctx.storage.subscribers as
+		| { query(o?: object): Promise<{ items: Array<{ id: string; data: Record<string, unknown> }> }>; delete(id: string): Promise<boolean> }
+		| undefined;
+	if (!legacy) return;
+	try {
+		const rows = await legacy.query({ limit: 100 });
+		if (rows.items.length === 0) return;
+		if (!(await collectionAvailable(ctx))) return;
+		for (const { id, data } of rows.items) {
+			const email = normalizeEmail(data.email ?? id);
+			if (!email) continue;
+			const subscription =
+				data.status === "bounced" ? "confirmed" : ((data.status as SubscriberData["subscription"]) ?? "pending");
+			await upsertSubscriber(ctx, email, {
+				subscription,
+				blocked: data.status === "bounced",
+				token: (data.token as string) ?? randomToken(),
+				soft_fails: (data.softFails as number) ?? 0,
+				bounce_reason: (data.bounceReason as string) ?? undefined,
+			});
+			await legacy.delete(id);
+		}
+		ctx.log.info(`Migrated ${rows.items.length} legacy subscribers into the collection`);
+	} catch (error) {
+		ctx.log.error("Legacy subscriber migration failed", error);
+	}
+}
+
+// ——————————————————————— markdown, templates, merging ———————————————————————
 
 function escapeHtml(s: string): string {
 	return s
@@ -176,16 +313,103 @@ function escapeHtml(s: string): string {
 		.replace(/"/g, "&quot;");
 }
 
-async function sendConfirmationEmail(ctx: PluginContext, sub: Subscriber): Promise<void> {
+/** Tiny Markdown subset: #/##/### headings, -/* lists, ---, **bold**, *italic*, [text](url). */
+function markdownToHtml(md: string): string {
+	const inline = (s: string): string =>
+		escapeHtml(s)
+			.replace(/\[([^\]]+)\]\((https?:\/\/[^)\s]+)\)/g, '<a href="$2">$1</a>')
+			.replace(/\*\*([^*]+)\*\*/g, "<strong>$1</strong>")
+			.replace(/\*([^*]+)\*/g, "<em>$1</em>");
+
+	return md
+		.split(/\n{2,}/)
+		.map((block) => {
+			const trimmed = block.trim();
+			if (!trimmed) return "";
+			if (/^---+$/.test(trimmed)) return "<hr>";
+			const heading = trimmed.match(/^(#{1,3})\s+(.*)$/s);
+			if (heading) {
+				const level = heading[1].length + 1; // h2–h4 inside emails
+				return `<h${level}>${inline(heading[2].trim())}</h${level}>`;
+			}
+			const lines = trimmed.split("\n");
+			if (lines.every((l) => /^\s*[-*]\s+/.test(l))) {
+				const items = lines.map((l) => `<li>${inline(l.replace(/^\s*[-*]\s+/, ""))}</li>`).join("");
+				return `<ul>${items}</ul>`;
+			}
+			return `<p>${lines.map(inline).join("<br>")}</p>`;
+		})
+		.filter(Boolean)
+		.join("\n");
+}
+
+/** Plain-text version: markdown with links flattened and emphasis stripped. */
+function markdownToText(md: string): string {
+	return md
+		.replace(/\[([^\]]+)\]\((https?:\/\/[^)\s]+)\)/g, "$1 ($2)")
+		.replace(/\*\*([^*]+)\*\*/g, "$1")
+		.replace(/\*([^*]+)\*/g, "$1")
+		.replace(/^#{1,3}\s+/gm, "");
+}
+
+/** Replace {{field}} merge tags from subscriber data (missing fields → ""). */
+function mergeTags(text: string, data: Record<string, unknown>): string {
+	return text.replace(/\{\{\s*([a-zA-Z0-9_]+)\s*\}\}/g, (_m, key: string) => {
+		const value = data[key];
+		if (value === undefined || value === null) return "";
+		return typeof value === "string" ? value : String(value);
+	});
+}
+
+const DEFAULT_TEMPLATE = `<!doctype html>
+<html>
+<body style="margin:0;padding:0;background:#f4f4f4;font-family:Georgia,serif;color:#222">
+	<div style="max-width:600px;margin:0 auto;padding:32px 24px;background:#ffffff">
+		{{content}}
+		<hr style="border:none;border-top:1px solid #ddd;margin:32px 0 16px">
+		<p style="font-size:12px;color:#777">You're receiving this because you subscribed to {{list_name}}.
+		<a href="{{unsubscribe_url}}" style="color:#777">Unsubscribe</a></p>
+	</div>
+</body>
+</html>`;
+
+async function renderEmail(
+	ctx: PluginContext,
+	subject: string,
+	body: string,
+	subscriber: SubscriberData,
+): Promise<{ subject: string; text: string; html: string }> {
+	const origin = await getOrigin(ctx);
+	const listName = await getListName(ctx);
+	const unsubscribeUrl = `${origin}${await pagePath(ctx, "unsubscribe")}?token=${subscriber.token}`;
+	const template = (await ctx.kv.get<string>("settings:template")) || DEFAULT_TEMPLATE;
+
+	const mergedSubject = mergeTags(subject, subscriber);
+	const mergedBody = mergeTags(body, subscriber);
+
+	const html = template
+		.replace(/\{\{\s*content\s*\}\}/g, markdownToHtml(mergedBody))
+		.replace(/\{\{\s*subject\s*\}\}/g, escapeHtml(mergedSubject))
+		.replace(/\{\{\s*unsubscribe_url\s*\}\}/g, unsubscribeUrl)
+		.replace(/\{\{\s*list_name\s*\}\}/g, escapeHtml(listName));
+
+	const text = `${markdownToText(mergedBody)}\n\n—\nYou're receiving this because you subscribed to ${listName}.\nUnsubscribe: ${unsubscribeUrl}`;
+
+	return { subject: mergedSubject, text, html };
+}
+
+async function sendConfirmationEmail(ctx: PluginContext, sub: SubscriberData): Promise<void> {
 	if (!ctx.email) throw new Error("No email provider is configured");
 	const origin = await getOrigin(ctx);
 	const listName = await getListName(ctx);
 	const confirmUrl = `${origin}${await pagePath(ctx, "confirm")}?token=${sub.token}`;
+	const body = `Hi!\n\nSomeone (hopefully you) asked to join ${listName}.\n\n[Confirm your subscription](${confirmUrl})\n\nIf this wasn't you, ignore this email and you won't hear from us again.`;
+	const rendered = await renderEmail(ctx, `Confirm your subscription to ${listName}`, body, sub);
 	await ctx.email.send({
 		to: sub.email,
-		subject: `Confirm your subscription to ${listName}`,
+		subject: rendered.subject,
 		text: `Hi!\n\nSomeone (hopefully you) asked to join ${listName}.\n\nConfirm your subscription:\n${confirmUrl}\n\nIf this wasn't you, ignore this email and you won't hear from us again.`,
-		html: `<p>Hi!</p><p>Someone (hopefully you) asked to join ${escapeHtml(listName)}.</p><p><a href="${confirmUrl}">Confirm your subscription</a></p><p style="font-size:12px;color:#777">If this wasn't you, ignore this email and you won't hear from us again.</p>`,
+		html: rendered.html,
 	});
 }
 
@@ -203,14 +427,12 @@ async function processQueue(ctx: PluginContext): Promise<void> {
 		return;
 	}
 
-	const origin = await getOrigin(ctx);
-	const listName = await getListName(ctx);
-	const unsubPath = await pagePath(ctx, "unsubscribe");
 	const blastCache = new Map<string, Blast>();
 	const touchedBlasts = new Set<string>();
+	const extras = await gatherExtraData(ctx);
 
 	for (const { id, data: send } of queued.items) {
-		let blast = blastCache.get(send.blastId) ?? (await blasts(ctx).get(send.blastId));
+		const blast = blastCache.get(send.blastId) ?? (await blasts(ctx).get(send.blastId));
 		if (!blast) {
 			await sendsStore(ctx).put(id, { ...send, status: "failed", error: "blast missing" });
 			continue;
@@ -218,17 +440,20 @@ async function processQueue(ctx: PluginContext): Promise<void> {
 		blastCache.set(send.blastId, blast);
 		touchedBlasts.add(send.blastId);
 
-		const sub = await subscribers(ctx).get(send.email);
-		if (!sub || sub.status !== "confirmed") {
-			await sendsStore(ctx).put(id, { ...send, status: "failed", error: "not subscribed" });
+		const entry = await findByEmail(ctx, send.email);
+		const sub = entry?.data;
+		if (!sub || sub.subscription !== "confirmed" || sub.blocked) {
+			await sendsStore(ctx).put(id, { ...send, status: "failed", error: "not subscribed or blocked" });
 			blast.failed += 1;
 			continue;
 		}
 
-		const unsubscribeUrl = `${origin}${unsubPath}?token=${sub.token}`;
-		const { text, html } = withFooter(blast.body, listName, unsubscribeUrl);
 		try {
-			await ctx.email.send({ to: send.email, subject: blast.subject, text, html });
+			// Extra-source fields (attendee name, ticket type, …) merge under the
+			// primary record, so custom fields work as merge tags.
+			const mergedSub = { ...(extras.get(send.email) ?? {}), ...sub } as SubscriberData;
+			const rendered = await renderEmail(ctx, blast.subject, blast.body, mergedSub);
+			await ctx.email.send({ to: send.email, subject: rendered.subject, text: rendered.text, html: rendered.html });
 			await sendsStore(ctx).put(id, { ...send, status: "sent", sentAt: now() });
 			blast.sent += 1;
 		} catch (error) {
@@ -254,65 +479,59 @@ async function processQueue(ctx: PluginContext): Promise<void> {
 
 async function enqueueBlast(ctx: PluginContext, subject: string, body: string): Promise<{ blastId: string; total: number }> {
 	const blastId = `blast_${Date.now()}_${randomToken().slice(0, 6)}`;
-	let total = 0;
-	let cursor: string | undefined;
-	do {
-		const page = await subscribers(ctx).query({
-			where: { status: "confirmed" },
-			limit: 100,
-			cursor,
-		});
-		if (page.items.length > 0) {
-			await sendsStore(ctx).putMany(
-				page.items.map(({ data: sub }) => ({
-					id: `${blastId}:${sub.email}`,
-					data: {
-						blastId,
-						email: sub.email,
-						status: "queued" as const,
-						createdAt: now(),
-					},
-				})),
-			);
-			total += page.items.length;
+	const primary = await listAllSubscribers(ctx);
+	const byEmail = new Map(primary.map((e) => [e.data.email, e]));
+	const recipients = primary.filter((e) => e.data.subscription === "confirmed" && !e.data.blocked);
+	// Extra source collections (e.g. attendees): anyone with an email and no
+	// primary record gets materialized as a confirmed subscriber (with a real
+	// unsubscribe token). Existing primary records govern — unsubscribed or
+	// blocked addresses are never re-added.
+	const extras = await gatherExtraData(ctx);
+	for (const [email, data] of extras) {
+		if (byEmail.has(email)) continue;
+		try {
+			const entry = await upsertSubscriber(ctx, email, {
+				subscription: "confirmed",
+				source: typeof data._collection === "string" ? (data._collection as string) : "import",
+			});
+			recipients.push(entry);
+			byEmail.set(email, entry);
+		} catch (error) {
+			ctx.log.error(`Mailing list: failed to materialize ${email}`, error);
 		}
-		cursor = page.cursor && page.hasMore ? page.cursor : undefined;
-	} while (cursor);
-
+	}
+	if (recipients.length > 0) {
+		await sendsStore(ctx).putMany(
+			recipients.map((e) => ({
+				id: `${blastId}:${e.data.email}`,
+				data: { blastId, email: e.data.email, status: "queued" as const, createdAt: now() },
+			})),
+		);
+	}
 	await blasts(ctx).put(blastId, {
 		subject,
 		body,
 		status: "sending",
-		total,
+		total: recipients.length,
 		sent: 0,
 		delivered: 0,
 		failed: 0,
 		bounced: 0,
 		createdAt: now(),
 	});
-	return { blastId, total };
+	return { blastId, total: recipients.length };
 }
 
 // —————————————————————————————— webhook events ——————————————————————————————
 
-/**
- * Postal webhook payloads (Server → Webhooks). Relevant events:
- * - MessageSent            — accepted by the remote server (treat as delivered)
- * - MessageDeliveryFailed  — payload.status HardFail/SoftFail
- * - MessageBounced         — a bounce message was received
- * - MessageHeld            — held by Postal (treat as soft failure)
- */
 async function handlePostalEvent(ctx: PluginContext, event: string, payload: Record<string, unknown>): Promise<string> {
 	const message = (payload?.message ?? payload?.original_message ?? payload) as Record<string, unknown> | undefined;
 	const email = normalizeEmail(message?.to);
 	if (!email) return "ignored: no recipient";
 
-	const sub = await subscribers(ctx).get(email);
-	// Most recent send for this address (single-field index; sort client-side).
+	const entry = await findByEmail(ctx, email);
 	const sendsForEmail = await sendsStore(ctx).query({ where: { email }, limit: 100 });
-	const sendRow = sendsForEmail.items
-		.slice()
-		.sort((a, b) => (a.data.createdAt < b.data.createdAt ? 1 : -1))[0];
+	const sendRow = sendsForEmail.items.slice().sort((a, b) => (a.data.createdAt < b.data.createdAt ? 1 : -1))[0];
 
 	const applySendStatus = async (status: Send["status"], error?: string) => {
 		if (!sendRow || sendRow.data.status === status) return;
@@ -326,55 +545,42 @@ async function handlePostalEvent(ctx: PluginContext, event: string, payload: Rec
 		}
 	};
 
+	const block = async (reason: string) => {
+		if (entry && !entry.data.blocked) {
+			await upsertSubscriber(ctx, email, { blocked: true, bounce_reason: reason });
+		}
+	};
+
 	switch (event) {
 		case "MessageSent":
 			await applySendStatus("delivered");
 			return `delivered: ${email}`;
 
-		case "MessageBounced": {
+		case "MessageBounced":
 			await applySendStatus("bounced", "bounced");
-			if (sub && sub.status !== "unsubscribed") {
-				await subscribers(ctx).put(email, {
-					...sub,
-					status: "bounced",
-					bounceReason: "bounce received",
-					unsubscribedAt: now(),
-				});
-			}
-			return `bounced (removed from list): ${email}`;
-		}
+			await block("bounce received");
+			return `bounced (blocked): ${email}`;
 
 		case "MessageDeliveryFailed":
 		case "MessageHeld": {
 			const status = String((payload as Record<string, unknown>)?.status ?? "");
-			const hard = status === "HardFail";
-			if (hard) {
+			if (status === "HardFail") {
 				await applySendStatus("bounced", "hard delivery failure");
-				if (sub && sub.status !== "unsubscribed") {
-					await subscribers(ctx).put(email, {
-						...sub,
-						status: "bounced",
-						bounceReason: `HardFail: ${String((payload as Record<string, unknown>)?.details ?? "").slice(0, 200)}`,
-						unsubscribedAt: now(),
-					});
-				}
-				return `hard fail (removed from list): ${email}`;
+				await block(`HardFail: ${String((payload as Record<string, unknown>)?.details ?? "").slice(0, 200)}`);
+				return `hard fail (blocked): ${email}`;
 			}
-			// Soft failure — count it; three strikes and the address is out.
-			if (sub) {
-				const softFails = (sub.softFails ?? 0) + 1;
-				if (softFails >= 3 && sub.status === "confirmed") {
+			if (entry) {
+				const softFails = (entry.data.soft_fails ?? 0) + 1;
+				if (softFails >= 3 && !entry.data.blocked) {
 					await applySendStatus("bounced", "3 soft failures");
-					await subscribers(ctx).put(email, {
-						...sub,
-						softFails,
-						status: "bounced",
-						bounceReason: "3 consecutive soft delivery failures",
-						unsubscribedAt: now(),
+					await upsertSubscriber(ctx, email, {
+						soft_fails: softFails,
+						blocked: true,
+						bounce_reason: "3 consecutive soft delivery failures",
 					});
-					return `soft fail #${softFails} (removed from list): ${email}`;
+					return `soft fail #${softFails} (blocked): ${email}`;
 				}
-				await subscribers(ctx).put(email, { ...sub, softFails });
+				await upsertSubscriber(ctx, email, { soft_fails: softFails });
 				return `soft fail #${softFails}: ${email}`;
 			}
 			return `soft fail (unknown subscriber): ${email}`;
@@ -388,28 +594,79 @@ async function handlePostalEvent(ctx: PluginContext, event: string, payload: Rec
 // ——————————————————————————————— admin page ————————————————————————————————
 
 async function buildAdminPage(ctx: PluginContext): Promise<Record<string, unknown>> {
-	const [confirmed, pending, unsubscribed, bounced] = await Promise.all([
-		subscribers(ctx).count({ status: "confirmed" }),
-		subscribers(ctx).count({ status: "pending" }),
-		subscribers(ctx).count({ status: "unsubscribed" }),
-		subscribers(ctx).count({ status: "bounced" }),
-	]);
+	const available = await collectionAvailable(ctx);
+	const collection = await getCollection(ctx);
 
-	const recentSubs = await subscribers(ctx).query({
-		orderBy: { createdAt: "desc" },
-		limit: 15,
-	});
-	const recentBlasts = await blasts(ctx).query({
-		orderBy: { createdAt: "desc" },
-		limit: 10,
-	});
+	if (!available) {
+		return {
+			blocks: [
+				{ type: "header", text: "Mailing List" },
+				{
+					type: "banner",
+					title: `Collection "${collection}" not found`,
+					description:
+						"Subscribers are stored as regular CMS content. Create a collection with that slug (fields: email, status, blocked, token, soft_fails, bounce_reason) or set a different slug in KV settings:collection, then reload this page.",
+					variant: "error",
+				},
+			],
+		};
+	}
+
+	const all = await listAllSubscribers(ctx);
+	const extras = await gatherExtraData(ctx);
+	const primaryEmails = new Set(all.map((e) => e.data.email));
+	const extraOnly = [...extras.keys()].filter((email) => !primaryEmails.has(email)).length;
+	const confirmed =
+		all.filter((e) => e.data.subscription === "confirmed" && !e.data.blocked).length + extraOnly;
+	const pending = all.filter((e) => e.data.subscription === "pending").length;
+	const unsubscribed = all.filter((e) => e.data.subscription === "unsubscribed").length;
+	const blocked = all.filter((e) => e.data.blocked).length;
+
+	const recent = all.slice(-12).reverse();
+	const recentBlasts = await blasts(ctx).query({ orderBy: { createdAt: "desc" }, limit: 8 });
 
 	const origin = await getOrigin(ctx);
 	const secret = await getWebhookSecret(ctx);
 	const listName = await getListName(ctx);
 	const batchSize = (await ctx.kv.get<number>("settings:batchSize")) ?? 25;
-	const webhookUrl = routeUrl(origin || "https://<your-site>", "webhook", { key: secret });
+	const template = (await ctx.kv.get<string>("settings:template")) ?? "";
+	const collectionsCsv = (await getCollections(ctx)).join(", ");
+	const webhookUrl = `${origin || "https://<your-site>"}/_emdash/api/plugins/emdash-mailing-list/webhook?key=${secret}`;
 	const subscribeUrl = `${origin || "https://<your-site>"}/_emdash/api/plugins/emdash-mailing-list/subscribe`;
+
+	const subscriberBlocks = recent.flatMap((e) => {
+		const d = e.data;
+		const flags = [d.subscription, d.blocked ? "BLOCKED" : null, d.bounce_reason ? `(${d.bounce_reason})` : null]
+			.filter(Boolean)
+			.join(" · ");
+		const buttons: Array<Record<string, unknown>> = [];
+		if (d.subscription === "pending") {
+			buttons.push({ type: "button", action_id: "sub_confirm", value: d.email, label: "Confirm", style: "primary" });
+		}
+		buttons.push(
+			d.blocked
+				? { type: "button", action_id: "sub_unblock", value: d.email, label: "Unblock" }
+				: { type: "button", action_id: "sub_block", value: d.email, label: "Block" },
+		);
+		buttons.push({
+			type: "button",
+			action_id: "sub_delete",
+			value: d.email,
+			label: "Delete",
+			style: "danger",
+			confirm: {
+				title: "Delete subscriber?",
+				text: `Permanently remove ${d.email} from the list. This cannot be undone.`,
+				confirm: "Delete",
+				deny: "Cancel",
+			},
+		});
+		return [
+			{ type: "section", text: `**${d.email}** — ${flags}` },
+			{ type: "actions", elements: buttons },
+			{ type: "divider" },
+		];
+	});
 
 	return {
 		blocks: [
@@ -417,29 +674,28 @@ async function buildAdminPage(ctx: PluginContext): Promise<Record<string, unknow
 			{
 				type: "stats",
 				items: [
-					{ label: "Confirmed", value: confirmed },
+					{ label: "Sendable", value: confirmed, description: extraOnly ? `${extraOnly} from extra sources` : undefined },
 					{ label: "Pending", value: pending },
+					{ label: "Blocked", value: blocked, description: "bounced or manually blocked" },
 					{ label: "Unsubscribed", value: unsubscribed },
-					{ label: "Bounced", value: bounced },
 				],
+			},
+			{
+				type: "context",
+				text: `Subscribers live in the “${collection}” content collection — browse and edit them under Content, and add custom fields (e.g. is_wine_club_member) in the schema editor. Every field works as a {{merge_tag}} in blasts.`,
 			},
 
 			{ type: "header", text: "Send a blast" },
 			{
 				type: "section",
-				text: `Composes and queues an email to every confirmed subscriber (currently ${confirmed}). Sending happens in batches of ${batchSize} per minute; progress shows in the table below. An unsubscribe link is added automatically.`,
+				text: `Markdown supported: **bold**, *italic*, [links](https://…), # headings, - lists. Merge tags like {{email}} (or any subscriber field) are replaced per recipient. Sends go to ${confirmed} sendable subscribers in batches of ${batchSize}/minute; an unsubscribe link is added automatically.`,
 			},
 			{
 				type: "form",
 				block_id: "compose",
 				fields: [
 					{ type: "text_input", action_id: "subject", label: "Subject" },
-					{
-						type: "text_input",
-						action_id: "body",
-						label: "Message (plain text; blank line = new paragraph)",
-						multiline: true,
-					},
+					{ type: "text_input", action_id: "body", label: "Message (Markdown)", multiline: true },
 					{
 						type: "text_input",
 						action_id: "test_to",
@@ -475,38 +731,13 @@ async function buildAdminPage(ctx: PluginContext): Promise<Record<string, unknow
 				})),
 			},
 
-			{ type: "header", text: "Subscribers (latest 15)" },
-			{
-				type: "table",
-				page_action_id: "subs_page",
-				empty_text: "No subscribers yet.",
-				columns: [
-					{ key: "email", label: "Email" },
-					{ key: "status", label: "Status" },
-					{ key: "createdAt", label: "Signed up", format: "relative_time" },
-				],
-				rows: recentSubs.items.map(({ data: s }) => ({
-					email: s.email,
-					status: s.status,
-					createdAt: s.createdAt,
-				})),
-			},
+			{ type: "header", text: `Subscribers (latest ${recent.length} of ${all.length})` },
+			...subscriberBlocks,
 			{
 				type: "form",
 				block_id: "manual",
-				fields: [
-					{ type: "text_input", action_id: "email", label: "Email address" },
-					{
-						type: "select",
-						action_id: "action",
-						label: "Action",
-						options: [
-							{ label: "Add as confirmed subscriber", value: "add" },
-							{ label: "Unsubscribe / remove", value: "remove" },
-						],
-					},
-				],
-				submit: { label: "Apply", action_id: "manual_change" },
+				fields: [{ type: "text_input", action_id: "email", label: "Add subscriber (immediately confirmed)" }],
+				submit: { label: "Add", action_id: "manual_add" },
 			},
 
 			{ type: "header", text: "Settings" },
@@ -528,6 +759,19 @@ async function buildAdminPage(ctx: PluginContext): Promise<Record<string, unknow
 						max: 100,
 						initial_value: batchSize,
 					},
+					{
+						type: "text_input",
+						action_id: "collections",
+						label: "Source collections (comma-separated; first is the primary list, extras like an attendees collection just need an email field)",
+						initial_value: collectionsCsv,
+					},
+					{
+						type: "text_input",
+						action_id: "template",
+						label: "HTML email template — {{content}} is replaced with the rendered message; also available: {{subject}}, {{unsubscribe_url}}, {{list_name}}. Leave empty for the plain default.",
+						multiline: true,
+						initial_value: template,
+					},
 				],
 				submit: { label: "Save Settings", action_id: "save_settings" },
 			},
@@ -535,24 +779,29 @@ async function buildAdminPage(ctx: PluginContext): Promise<Record<string, unknow
 			{ type: "header", text: "Wiring" },
 			{
 				type: "section",
-				text: "Signup endpoint — POST JSON `{ \"email\": \"...\" }` from your site's form. Confirmation and unsubscribe emails link to /mailing/confirm and /mailing/unsubscribe pages on your site (see the README for copy-paste Astro pages; paths configurable via KV settings:confirmPath / settings:unsubscribePath).",
+				text: "Signup endpoint — POST JSON `{ \"email\": \"...\" }` from your site's form. Confirmation/unsubscribe emails link to /mailing/confirm and /mailing/unsubscribe pages on your site (see README).",
 			},
 			{ type: "code", code: subscribeUrl, language: "bash" },
 			{
 				type: "section",
-				text: "Bounce tracking — in Postal (Server → Webhooks) add a webhook pointing at the URL below with events MessageSent, MessageDeliveryFailed, MessageBounced, MessageHeld. Hard bounces automatically remove the address from the list; three soft failures do the same.",
+				text: "Postal webhook (Server → Webhooks; events MessageSent, MessageDeliveryFailed, MessageBounced, MessageHeld). Hard bounces block the address automatically; three soft failures do the same. Blocked subscribers stay on the list but never receive sends until unblocked.",
 			},
 			{ type: "code", code: webhookUrl, language: "bash" },
 		],
 	};
 }
 
+async function adminWithToast(ctx: PluginContext, message: string, type: "success" | "error"): Promise<Record<string, unknown>> {
+	return { ...(await buildAdminPage(ctx)), toast: { message, type } };
+}
+
 // ————————————————————————————————— plugin ——————————————————————————————————
 
 export default definePlugin({
 	id: "emdash-mailing-list",
-	version: "0.1.0",
+	version: "0.2.0",
 	storage: {
+		// v0.1 legacy — kept so existing rows can be migrated into the collection.
 		subscribers: { indexes: ["email", "status", "token", "createdAt"] },
 		blasts: { indexes: ["status", "createdAt"] },
 		sends: { indexes: ["blastId", "email", "status", "createdAt"] },
@@ -561,8 +810,7 @@ export default definePlugin({
 		"plugin:activate": {
 			handler: async (_event: unknown, ctx: PluginContext) => {
 				await getWebhookSecret(ctx);
-				await ctx.cron!.schedule("process-queue", { schedule: "* * * * *" });
-				ctx.log.info("Mailing list plugin activated; send queue scheduled");
+				await ensureCron(ctx);
 			},
 		},
 		cron: {
@@ -573,104 +821,74 @@ export default definePlugin({
 	},
 
 	routes: {
-		// POST { email } — public signup. Sends a double opt-in confirmation.
 		subscribe: {
 			public: true,
 			handler: async (rctx: RC, hostCtx?: PluginContext) => {
-				// Runtime passes (routeCtx, pluginCtx); newer typings merge them.
 				const ctx = (hostCtx ?? rctx) as PluginContext;
-				const routeCtx = rctx;
-				await rememberOrigin(ctx, routeCtx.request);
+				await rememberOrigin(ctx, rctx.request);
 				await ensureCron(ctx);
-				const input = (routeCtx.input ?? {}) as Record<string, unknown>;
-				// Honeypot: real forms leave "website" empty. Bots that fill it get
-				// a fake success and no email.
+				const input = (rctx.input ?? {}) as Record<string, unknown>;
 				if (typeof input.website === "string" && input.website.trim() !== "") {
-					return { ok: true };
+					return { ok: true }; // honeypot
 				}
 				const email = normalizeEmail(input.email);
 				if (!email) return { ok: false, error: "invalid_email" };
+				if (!(await collectionAvailable(ctx))) return { ok: false, error: "not_configured" };
 
-				const existing = await subscribers(ctx).get(email);
-				if (existing?.status === "confirmed") return { ok: true, already: true };
-
-				const sub: Subscriber = {
-					email,
-					status: "pending",
-					token: existing?.token ?? randomToken(),
-					softFails: 0,
-					createdAt: existing?.createdAt ?? now(),
-				};
-				await subscribers(ctx).put(email, sub);
-				await sendConfirmationEmail(ctx, sub);
+				const existing = await findByEmail(ctx, email);
+				if (existing?.data.subscription === "confirmed" && !existing.data.blocked) {
+					return { ok: true, already: true };
+				}
+				const entry = await upsertSubscriber(ctx, email, {
+					subscription: "pending",
+					source: (existing?.data.source as string) ?? "signup",
+					token: existing?.data.token ?? randomToken(),
+				});
+				await sendConfirmationEmail(ctx, entry.data);
 				return { ok: true };
 			},
 		},
 
-		// GET ?token — confirm subscription, then redirect to the site.
 		confirm: {
 			public: true,
 			handler: async (rctx: RC, hostCtx?: PluginContext) => {
-				// Runtime passes (routeCtx, pluginCtx); newer typings merge them.
 				const ctx = (hostCtx ?? rctx) as PluginContext;
-				const routeCtx = rctx;
-				await rememberOrigin(ctx, routeCtx.request);
+				await rememberOrigin(ctx, rctx.request);
 				const token =
-					String((routeCtx.input as Record<string, unknown>)?.token ?? "") ||
-					(new URL(routeCtx.request.url).searchParams.get("token") ?? "");
-				if (!token) return { ok: false, state: "invalid" };
-				const match = await subscribers(ctx).query({ where: { token }, limit: 1 });
-				const row = match.items[0];
-				if (!row) return { ok: false, state: "invalid" };
-				await subscribers(ctx).put(row.id, {
-					...row.data,
-					status: "confirmed",
-					softFails: 0,
-					confirmedAt: now(),
-				});
+					String((rctx.input as Record<string, unknown>)?.token ?? "") ||
+					(new URL(rctx.request.url).searchParams.get("token") ?? "");
+				const entry = await findByToken(ctx, token);
+				if (!entry) return { ok: false, state: "invalid" };
+				await upsertSubscriber(ctx, entry.data.email, { subscription: "confirmed", soft_fails: 0 });
 				return { ok: true, state: "confirmed" };
 			},
 		},
 
-		// GET ?token — one-click unsubscribe, then redirect to the site.
 		unsubscribe: {
 			public: true,
 			handler: async (rctx: RC, hostCtx?: PluginContext) => {
-				// Runtime passes (routeCtx, pluginCtx); newer typings merge them.
 				const ctx = (hostCtx ?? rctx) as PluginContext;
-				const routeCtx = rctx;
-				await rememberOrigin(ctx, routeCtx.request);
+				await rememberOrigin(ctx, rctx.request);
 				const token =
-					String((routeCtx.input as Record<string, unknown>)?.token ?? "") ||
-					(new URL(routeCtx.request.url).searchParams.get("token") ?? "");
-				if (!token) return { ok: false, state: "invalid" };
-				const match = await subscribers(ctx).query({ where: { token }, limit: 1 });
-				const row = match.items[0];
-				if (row && row.data.status !== "unsubscribed") {
-					await subscribers(ctx).put(row.id, {
-						...row.data,
-						status: "unsubscribed",
-						unsubscribedAt: now(),
-					});
+					String((rctx.input as Record<string, unknown>)?.token ?? "") ||
+					(new URL(rctx.request.url).searchParams.get("token") ?? "");
+				const entry = await findByToken(ctx, token);
+				if (entry && entry.data.subscription !== "unsubscribed") {
+					await upsertSubscriber(ctx, entry.data.email, { subscription: "unsubscribed" });
 				}
-				return { ok: true, state: "unsubscribed" };
+				return { ok: entry != null, state: entry ? "unsubscribed" : "invalid" };
 			},
 		},
 
-		// POST — Postal webhook receiver (?key=<secret> authenticates).
 		webhook: {
 			public: true,
 			handler: async (rctx: RC, hostCtx?: PluginContext) => {
-				// Runtime passes (routeCtx, pluginCtx); newer typings merge them.
 				const ctx = (hostCtx ?? rctx) as PluginContext;
-				const routeCtx = rctx;
-				const url = new URL(routeCtx.request.url);
+				const url = new URL(rctx.request.url);
 				const key = url.searchParams.get("key") ?? "";
 				const secret = await ctx.kv.get<string>("state:webhookSecret");
-				if (!secret || key !== secret) {
-					return { ok: false, error: "unauthorized" };
-				}
-				const body = (routeCtx.input ?? {}) as Record<string, unknown>;
+				if (!secret || key !== secret) return { ok: false, error: "unauthorized" };
+				const body = (rctx.input ?? {}) as Record<string, unknown>;
 				const event = String(body.event ?? "");
 				const payload = (body.payload ?? {}) as Record<string, unknown>;
 				const result = await handlePostalEvent(ctx, event, payload);
@@ -679,24 +897,50 @@ export default definePlugin({
 			},
 		},
 
-		// Block Kit admin page.
 		admin: {
 			handler: async (rctx: RC, hostCtx?: PluginContext) => {
-				// Runtime passes (routeCtx, pluginCtx); newer typings merge them.
 				const ctx = (hostCtx ?? rctx) as PluginContext;
-				const routeCtx = rctx;
-				await rememberOrigin(ctx, routeCtx.request);
-				const interaction = routeCtx.input as {
+				await rememberOrigin(ctx, rctx.request);
+				const interaction = rctx.input as {
 					type: string;
 					page?: string;
 					action_id?: string;
+					value?: unknown;
 					values?: Record<string, unknown>;
 				};
 
-				if (interaction.type === "page_load" || interaction.type === "block_action") {
+				if (interaction.type === "page_load") {
 					await ensureCron(ctx);
+					await migrateLegacySubscribers(ctx);
 					return buildAdminPage(ctx);
 				}
+
+				// Per-subscriber row actions
+				if (interaction.type === "block_action" && interaction.action_id?.startsWith("sub_")) {
+					const email = normalizeEmail(interaction.value);
+					if (!email) return adminWithToast(ctx, "Missing subscriber email", "error");
+					const entry = await findByEmail(ctx, email);
+					if (!entry) return adminWithToast(ctx, `${email} not found`, "error");
+					switch (interaction.action_id) {
+						case "sub_confirm":
+							await upsertSubscriber(ctx, email, { subscription: "confirmed", soft_fails: 0 });
+							return adminWithToast(ctx, `${email} confirmed`, "success");
+						case "sub_block":
+							await upsertSubscriber(ctx, email, { blocked: true, bounce_reason: "manually blocked" });
+							return adminWithToast(ctx, `${email} blocked`, "success");
+						case "sub_unblock":
+							await upsertSubscriber(ctx, email, { blocked: false, soft_fails: 0, bounce_reason: "" });
+							return adminWithToast(ctx, `${email} unblocked`, "success");
+						case "sub_delete": {
+							const collection = await getCollection(ctx);
+							await contentApi(ctx).delete(collection, entry.id);
+							await ctx.kv.delete(`tok:${entry.data.token}`);
+							return adminWithToast(ctx, `${email} deleted`, "success");
+						}
+					}
+				}
+
+				if (interaction.type === "block_action") return buildAdminPage(ctx);
 
 				if (interaction.type === "form_submit" && interaction.action_id === "save_settings") {
 					const values = interaction.values ?? {};
@@ -707,36 +951,20 @@ export default definePlugin({
 					if (Number.isFinite(batch) && batch >= 1 && batch <= 100) {
 						await ctx.kv.set("settings:batchSize", Math.floor(batch));
 					}
-					return { ...(await buildAdminPage(ctx)), toast: { message: "Settings saved", type: "success" } };
+					if (typeof values.template === "string") {
+						await ctx.kv.set("settings:template", values.template.trim());
+					}
+					if (typeof values.collections === "string" && values.collections.trim()) {
+						await ctx.kv.set("settings:collections", values.collections.trim());
+					}
+					return adminWithToast(ctx, "Settings saved", "success");
 				}
 
-				if (interaction.type === "form_submit" && interaction.action_id === "manual_change") {
-					const values = interaction.values ?? {};
-					const email = normalizeEmail(values.email);
-					if (!email) {
-						return { ...(await buildAdminPage(ctx)), toast: { message: "Invalid email address", type: "error" } };
-					}
-					const action = String(values.action ?? "add");
-					const existing = await subscribers(ctx).get(email);
-					if (action === "remove") {
-						if (existing) {
-							await subscribers(ctx).put(email, {
-								...existing,
-								status: "unsubscribed",
-								unsubscribedAt: now(),
-							});
-						}
-						return { ...(await buildAdminPage(ctx)), toast: { message: `${email} removed`, type: "success" } };
-					}
-					await subscribers(ctx).put(email, {
-						email,
-						status: "confirmed",
-						token: existing?.token ?? randomToken(),
-						softFails: 0,
-						createdAt: existing?.createdAt ?? now(),
-						confirmedAt: now(),
-					});
-					return { ...(await buildAdminPage(ctx)), toast: { message: `${email} added as confirmed`, type: "success" } };
+				if (interaction.type === "form_submit" && interaction.action_id === "manual_add") {
+					const email = normalizeEmail(interaction.values?.email);
+					if (!email) return adminWithToast(ctx, "Invalid email address", "error");
+					await upsertSubscriber(ctx, email, { subscription: "confirmed", source: "manual" });
+					return adminWithToast(ctx, `${email} added as confirmed`, "success");
 				}
 
 				if (interaction.type === "form_submit" && interaction.action_id === "send_blast") {
@@ -744,33 +972,33 @@ export default definePlugin({
 					const subject = typeof values.subject === "string" ? values.subject.trim() : "";
 					const body = typeof values.body === "string" ? values.body.trim() : "";
 					const testTo = normalizeEmail(values.test_to);
-					if (!subject || !body) {
-						return { ...(await buildAdminPage(ctx)), toast: { message: "Subject and message are required", type: "error" } };
-					}
+					if (!subject || !body) return adminWithToast(ctx, "Subject and message are required", "error");
 
 					try {
 						if (testTo) {
 							if (!ctx.email) throw new Error("No email provider is configured");
-							const origin = await getOrigin(ctx);
-							const listName = await getListName(ctx);
-							const { text, html } = withFooter(body, listName, `${origin}${await pagePath(ctx, "unsubscribe")}?token=test`);
-							await ctx.email.send({ to: testTo, subject: `[TEST] ${subject}`, text, html });
-							return { ...(await buildAdminPage(ctx)), toast: { message: `Test sent to ${testTo}`, type: "success" } };
+							const testSub: SubscriberData = {
+								email: testTo,
+								subscription: "confirmed",
+								blocked: false,
+								token: "test",
+								soft_fails: 0,
+							};
+							const rendered = await renderEmail(ctx, subject, body, testSub);
+							await ctx.email.send({
+								to: testTo,
+								subject: `[TEST] ${rendered.subject}`,
+								text: rendered.text,
+								html: rendered.html,
+							});
+							return adminWithToast(ctx, `Test sent to ${testTo}`, "success");
 						}
 						await ensureCron(ctx);
 						const { total } = await enqueueBlast(ctx, subject, body);
-						if (total === 0) {
-							return { ...(await buildAdminPage(ctx)), toast: { message: "No confirmed subscribers to send to", type: "error" } };
-						}
-						return {
-							...(await buildAdminPage(ctx)),
-							toast: { message: `Blast queued to ${total} subscribers — sending starts within a minute`, type: "success" },
-						};
+						if (total === 0) return adminWithToast(ctx, "No sendable subscribers", "error");
+						return adminWithToast(ctx, `Blast queued to ${total} subscribers — sending starts within a minute`, "success");
 					} catch (error) {
-						return {
-							...(await buildAdminPage(ctx)),
-							toast: { message: `Error: ${error instanceof Error ? error.message : String(error)}`, type: "error" },
-						};
+						return adminWithToast(ctx, `Error: ${error instanceof Error ? error.message : String(error)}`, "error");
 					}
 				}
 

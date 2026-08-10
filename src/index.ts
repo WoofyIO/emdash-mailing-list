@@ -16,12 +16,15 @@ import type { PluginDescriptor } from "emdash";
 export function emdashMailingList(): PluginDescriptor {
 	return {
 		id: "emdash-mailing-list",
-		version: "0.1.0",
+		version: "0.2.0",
 		format: "standard",
 		entrypoint: "emdash-mailing-list/sandbox",
 		options: {},
-		capabilities: ["email:send"],
+		// content:* — subscribers live in a regular CMS collection so admins can
+		// browse them under Content and extend the schema with custom fields.
+		capabilities: ["email:send", "content:read", "content:write"],
 		storage: {
+			// v0.1 legacy rows — migrated into the collection on admin page load.
 			subscribers: {
 				indexes: ["email", "status", "token", "createdAt"],
 			},

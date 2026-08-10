@@ -15,11 +15,15 @@
 function emdashMailingList() {
 	return {
 		id: "emdash-mailing-list",
-		version: "0.1.0",
+		version: "0.2.0",
 		format: "standard",
 		entrypoint: "emdash-mailing-list/sandbox",
 		options: {},
-		capabilities: ["email:send"],
+		capabilities: [
+			"email:send",
+			"content:read",
+			"content:write"
+		],
 		storage: {
 			subscribers: { indexes: [
 				"email",

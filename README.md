@@ -1,18 +1,33 @@
 # emdash-mailing-list
 
-A *very* simple mailing list for [EmDash CMS](https://docs.emdashcms.com): signup with double opt-in, one-click unsubscribe, admin-composed mail blasts, per-blast delivery status, and automatic bounce handling via [Postal](https://postalserver.io) webhooks.
+A *very* simple mailing list for [EmDash CMS](https://docs.emdashcms.com): signup with double opt-in, one-click unsubscribe, admin-composed **Markdown** blasts in a **branded HTML template**, per-blast delivery status, and automatic bounce handling via [Postal](https://postalserver.io) webhooks.
 
 Email is delivered through whatever email provider the site already has configured (e.g. [emdash-postal](https://github.com/undefined-charity/emdash-postal)) — this plugin adds the list, not the transport.
 
+## How subscribers are stored
+
+**Subscribers are regular CMS content entries** in a `subscribers` collection — browse and edit them under **Content**, and extend the schema with your own fields (`is_wine_club_member`, `first_name`, …) in the admin schema editor. Every field is available as a `{{merge_tag}}` in blast subjects and bodies.
+
+Minimum fields (see the seed snippet below): `email` (string), `subscription` (string: `pending`/`confirmed`/`unsubscribed`), `blocked` (boolean), `token` (string), `soft_fails` (integer), `bounce_reason` (string), `source` (string).
+
+### Multiple source collections
+
+The **Source collections** setting takes a comma-separated list. The first is the *primary* list (where signups, tokens, and suppression live). Extra collections — for example an `attendees` collection on an events site — only need an `email` field:
+
+- Blasts go to primary sendable subscribers **plus** everyone in the extra collections.
+- Extra-source recipients are auto-materialized into the primary list on their first blast (with a real unsubscribe token, `source` set to `import`).
+- Unsubscribed/blocked addresses in the primary list are **never** emailed, regardless of which source they appear in.
+- Extra-collection fields (attendee name, ticket type, …) work as merge tags in emails to those recipients.
+
 ## Features
 
-- **Signup** — public JSON endpoint with an email-format check and a honeypot field; safe to call from any site form
-- **Double opt-in** — subscribers confirm via an emailed link before they ever receive a blast
+- **Signup** — public JSON endpoint with an email-format check and honeypot; safe to call from any site form
+- **Double opt-in** — subscribers confirm via an emailed link before receiving blasts
 - **Unsubscribe** — tokenized one-click link appended to every blast automatically
-- **Blasts** — compose plain text in the admin (blank line = paragraph); queued and sent in rate-limited batches by a cron task, with live sent/delivered/failed/bounced counts
-- **Test sends** — send the composed blast to a single address before the real thing
-- **Bounce handling** — a webhook endpoint for Postal delivery events: hard bounces and hard failures remove the address from the list immediately, three soft failures do the same, `MessageSent` upgrades a send to *delivered*
-- **Admin page** — subscriber stats and latest signups, manual add/remove, blast history, settings, and copy-paste wiring instructions — all under **Mailing List** in the admin sidebar
+- **Blasts** — Markdown compose (`**bold**`, `*italic*`, `[links](…)`, `#` headings, `-` lists), `{{merge_tags}}`, queued and sent in rate-limited batches with live sent/delivered/failed/bounced counts
+- **HTML template** — paste your site's email shell in settings; `{{content}}` receives the rendered message (also available: `{{subject}}`, `{{unsubscribe_url}}`, `{{list_name}}`). Leave empty for a clean default.
+- **Subscriber management** — per-row **Confirm / Block / Unblock / Delete** actions in the admin, plus manual add
+- **Bounce handling** — Postal webhook: hard bounces **block** the address (kept on the list for audit, never emailed), three soft failures do the same, `MessageSent` upgrades sends to *delivered*. Blocking is reversible with one click.
 
 ## Install
 
@@ -29,7 +44,27 @@ emdash({
 });
 ```
 
-Open **Admin → Mailing List** once after deploying — that first page load provisions the send-queue cron and the webhook secret.
+Create the subscribers collection (seed snippet — or build it in the admin schema editor):
+
+```json
+{
+  "slug": "subscribers",
+  "label": "Subscribers (Mailing List)",
+  "labelSingular": "Subscriber",
+  "supports": [],
+  "fields": [
+    { "slug": "email", "label": "Email", "type": "string", "required": true },
+    { "slug": "subscription", "label": "Subscription (pending / confirmed / unsubscribed)", "type": "string" },
+    { "slug": "blocked", "label": "Blocked (bounced or manually suppressed)", "type": "boolean" },
+    { "slug": "token", "label": "Confirm/unsubscribe token (managed by plugin)", "type": "string" },
+    { "slug": "soft_fails", "label": "Soft delivery failures", "type": "integer" },
+    { "slug": "bounce_reason", "label": "Bounce reason", "type": "string" },
+    { "slug": "source", "label": "Source (signup / manual / ticket / import…)", "type": "string" }
+  ]
+}
+```
+
+Open **Admin → Mailing List** once after deploying — the first page load provisions the send-queue cron and webhook secret, and migrates any v0.1 plugin-storage subscribers into the collection.
 
 ## Wire up your site
 
@@ -37,69 +72,59 @@ Open **Admin → Mailing List** once after deploying — that first page load pr
 
 POST JSON to the public endpoint. Include an empty `website` field as a bot honeypot.
 
-```html
-<form id="signup">
-  <input type="email" name="email" required />
-  <input type="text" name="website" style="position:absolute;left:-9999px" tabindex="-1" aria-hidden="true" />
-  <button>Join the list</button>
-</form>
-<script>
-  document.getElementById("signup").addEventListener("submit", async (e) => {
-    e.preventDefault();
-    const form = e.target;
-    const res = await fetch("/_emdash/api/plugins/emdash-mailing-list/subscribe", {
-      method: "POST",
-      headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ email: form.email.value, website: form.website.value }),
-    });
-    const json = await res.json();
-    alert(json.data?.ok ? "Check your inbox to confirm!" : "That address didn't look right.");
-  });
-</script>
+```js
+fetch("/_emdash/api/plugins/emdash-mailing-list/subscribe", {
+  method: "POST",
+  headers: { "Content-Type": "application/json" },
+  body: JSON.stringify({ email, website: "" }),
+});
 ```
 
 ### Confirm / unsubscribe pages
 
-Emails link to `/mailing/confirm?token=…` and `/mailing/unsubscribe?token=…` on your site (paths configurable via the plugin KV keys `settings:confirmPath` / `settings:unsubscribePath`). Add two small server-rendered pages that forward the token to the plugin and show a branded result:
+Emails link to `/mailing/confirm?token=…` and `/mailing/unsubscribe?token=…` on your site (paths configurable via KV `settings:confirmPath` / `settings:unsubscribePath`). Add two small pages whose **client-side** script forwards the token — call the API from the browser, not from the server: a Cloudflare Worker cannot `fetch()` its own domain.
 
 ```astro
 ---
-// src/pages/mailing/confirm.astro  (unsubscribe.astro is identical with s/confirm/unsubscribe/)
-const token = Astro.url.searchParams.get("token") ?? "";
-const res = await fetch(
-  `${Astro.url.origin}/_emdash/api/plugins/emdash-mailing-list/confirm?token=${encodeURIComponent(token)}`,
-);
-const { data } = await res.json();
+// src/pages/mailing/confirm.astro (unsubscribe.astro: s/confirm/unsubscribe/)
 ---
-{data?.state === "confirmed" ? <h1>You're on the list!</h1> : <h1>That link didn't work.</h1>}
+<h1 data-s="working">Confirming…</h1>
+<h1 data-s="confirmed" hidden>You're on the list!</h1>
+<h1 data-s="failed" hidden>That link didn't work.</h1>
+<script is:inline>
+  const token = new URLSearchParams(location.search).get("token") || "";
+  fetch("/_emdash/api/plugins/emdash-mailing-list/confirm?token=" + encodeURIComponent(token))
+    .then((r) => r.json())
+    .then((j) => {
+      const ok = j?.data?.state === "confirmed";
+      document.querySelectorAll("[data-s]").forEach((el) => (el.hidden = el.dataset.s !== (ok ? "confirmed" : "failed")));
+    });
+</script>
 ```
 
 ### Postal bounce webhook
 
-The admin page shows your webhook URL (it includes a generated secret):
+The admin page shows your webhook URL (it embeds a generated secret — treat the URL as a credential):
 
 ```
 https://your-site.com/_emdash/api/plugins/emdash-mailing-list/webhook?key=<secret>
 ```
 
-In Postal: **Server → Webhooks → Add webhook**, paste the URL, and select the events `MessageSent`, `MessageDeliveryFailed`, `MessageBounced`, and `MessageHeld`. That's the whole bounce pipeline: hard bounces flip the subscriber to `bounced` (they stop receiving blasts), and delivery confirmations upgrade blast stats from *sent* to *delivered*.
+In Postal: **Server → Webhooks → Add webhook**, paste the URL, select the events `MessageSent`, `MessageDeliveryFailed`, `MessageBounced`, `MessageHeld`.
 
 ## Notes & limits
 
-- Blasts are plain text (with an auto-generated simple HTML alternative). No templates, no segmentation, no scheduling — it's the *very simple* mailing list.
-- Batch size defaults to 25 sends/minute (configurable 1–100 in the admin) to stay friendly to Workers subrequest limits and your mail server's rates.
-- Subscribers live in EmDash plugin storage (your site's own database) — they ride along with whatever database backups you already run.
-- Bounce correlation is by recipient address (most recent send), which is exact for a single-list setup like this one.
-- The webhook authenticates via the secret in the URL rather than Postal's RSA signature — treat the URL as a credential.
+- Batch size defaults to 25 sends/minute (configurable 1–100) to stay friendly to Workers subrequest limits and your mail server.
+- Subscribers live in your site's own database and ride along with your existing backups.
+- Bounce correlation is by recipient address (most recent send) — exact for single-list setups.
+- No segmentation or scheduling (yet) — it's the *very simple* mailing list.
 
 ## Development
 
 ```bash
 npm install
-npm run build      # tsdown → dist/
+npm run build      # tsdown → dist/ (committed, so GitHub installs need no build step)
 npm run typecheck
 ```
-
-`dist/` is committed so the package installs cleanly from GitHub without running build scripts.
 
 MIT © Woofy
