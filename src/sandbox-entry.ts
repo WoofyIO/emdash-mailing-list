@@ -917,6 +917,12 @@ async function buildAdminPage(
 					},
 					{
 						type: "text_input",
+						action_id: "contactTo",
+						label: "Contact form recipient (blank disables the contact endpoint)",
+						initial_value: (await ctx.kv.get<string>("settings:contactTo")) ?? "",
+					},
+					{
+						type: "text_input",
 						action_id: "collections",
 						label: "Source collections (comma-separated; first is the primary list, extras like an attendees collection just need an email field)",
 						initial_value: collectionsCsv,
@@ -1001,6 +1007,59 @@ export default definePlugin({
 					token: existing?.data.token ?? randomToken(),
 				});
 				await sendConfirmationEmail(ctx, entry.data);
+				return { ok: true };
+			},
+		},
+
+		/**
+		 * POST { name, email, subject?, message } — public contact form.
+		 * Sends to settings:contactTo, CCs the submitter, sets Reply-To so
+		 * replies go straight back to them. Honeypot field: website.
+		 */
+		contact: {
+			public: true,
+			handler: async (rctx: RC, hostCtx?: PluginContext) => {
+				const ctx = (hostCtx ?? rctx) as PluginContext;
+				await rememberOrigin(ctx, rctx.request);
+				const input = (rctx.input ?? {}) as Record<string, unknown>;
+				if (typeof input.website === "string" && input.website.trim() !== "") {
+					return { ok: true }; // honeypot
+				}
+				const email = normalizeEmail(input.email);
+				const name = typeof input.name === "string" ? input.name.trim().slice(0, 120) : "";
+				const subject = typeof input.subject === "string" ? input.subject.trim().slice(0, 200) : "";
+				const message = typeof input.message === "string" ? input.message.trim().slice(0, 5000) : "";
+				if (!email) return { ok: false, error: "invalid_email" };
+				if (!name || !message) return { ok: false, error: "missing_fields" };
+				const contactTo = await ctx.kv.get<string>("settings:contactTo");
+				if (!contactTo) return { ok: false, error: "not_configured" };
+				if (!ctx.email) return { ok: false, error: "no_email_provider" };
+
+				const fullSubject = `[Contact] ${subject || "New message"} — ${name}`;
+				const text = `New contact form message
+
+From: ${name} <${email}>
+Subject: ${subject || "(none)"}
+
+${message}
+
+—
+Sent from the website contact form. Reply goes to the sender; they received a copy (CC).`;
+				const html = `<p><strong>New contact form message</strong></p>
+<p>From: ${escapeHtml(name)} &lt;${escapeHtml(email)}&gt;<br>Subject: ${escapeHtml(subject || "(none)")}</p>
+<blockquote style="border-left:3px solid #ccc;margin:12px 0;padding:4px 12px;white-space:pre-wrap">${escapeHtml(message)}</blockquote>
+<p style="font-size:12px;color:#777">Sent from the website contact form. Reply goes to the sender; they received a copy (CC).</p>`;
+
+				// cc / replyTo ride through the pipeline to transports that honor
+				// them (emdash-postal >= 0.2.0).
+				await ctx.email.send({
+					to: contactTo,
+					subject: fullSubject,
+					text,
+					html,
+					cc: email,
+					replyTo: email,
+				} as Parameters<NonNullable<PluginContext["email"]>["send"]>[0]);
 				return { ok: true };
 			},
 		},
@@ -1112,6 +1171,9 @@ export default definePlugin({
 					}
 					if (typeof values.collections === "string" && values.collections.trim()) {
 						await ctx.kv.set("settings:collections", values.collections.trim());
+					}
+					if (typeof values.contactTo === "string") {
+						await ctx.kv.set("settings:contactTo", values.contactTo.trim());
 					}
 					return adminWithToast(ctx, "Settings saved", "success");
 				}
