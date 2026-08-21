@@ -915,7 +915,10 @@ var sandbox_entry_default = definePlugin({
 			await ensureCron(ctx);
 		} },
 		cron: { handler: async (event, ctx) => {
-			if (event.name === "process-queue") await processQueue(ctx);
+			if (event.name === "process-queue") {
+				await ctx.kv.set("state:lastCron", now());
+				await processQueue(ctx);
+			}
 		} }
 	},
 	routes: {
@@ -1057,6 +1060,48 @@ Sent from the website contact form. Reply goes to the sender; they received a co
 				return {
 					ok: true,
 					result
+				};
+			}
+		},
+		/**
+		* GET — public watchdog for uptime monitoring. Checks the database (a
+		* real D1 read), the email provider, and the send-queue cron heartbeat.
+		* Keyword-monitor on "healthy": the overall status is only "healthy"
+		* when every check passes.
+		*/
+		health: {
+			public: true,
+			handler: async (rctx, hostCtx) => {
+				const ctx = hostCtx ?? rctx;
+				const checks = {};
+				let database = false;
+				try {
+					await contentApi(ctx).list(await getCollection(ctx), { limit: 1 });
+					database = true;
+				} catch {
+					database = false;
+				}
+				checks.database = database ? "up" : "down";
+				const emailProvider = Boolean(ctx.email);
+				checks.email_provider = emailProvider ? "configured" : "missing";
+				const lastCron = await ctx.kv.get("state:lastCron");
+				const cronAge = lastCron ? Math.round((Date.now() - new Date(lastCron).getTime()) / 1e3) : null;
+				checks.cron_age_seconds = cronAge;
+				const cronOk = cronAge !== null && cronAge < 300;
+				checks.cron = cronOk ? "beating" : "stale";
+				let queueOk = true;
+				try {
+					const queued = await sendsStore(ctx).count({ status: "queued" });
+					checks.queued_sends = queued;
+					queueOk = queued === 0 || cronOk;
+				} catch {
+					queueOk = false;
+					checks.queued_sends = "unknown";
+				}
+				return {
+					status: database && emailProvider && cronOk && queueOk ? "healthy" : "degraded",
+					checks,
+					ts: now()
 				};
 			}
 		},

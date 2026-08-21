@@ -15,7 +15,7 @@
 function emdashMailingList() {
 	return {
 		id: "emdash-mailing-list",
-		version: "0.3.1",
+		version: "0.3.2",
 		format: "standard",
 		entrypoint: "emdash-mailing-list/sandbox",
 		options: {},

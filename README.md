@@ -115,6 +115,17 @@ https://your-site.com/_emdash/api/plugins/emdash-mailing-list/webhook?key=<secre
 
 In Postal: **Server → Webhooks → Add webhook**, paste the URL, select the events `MessageSent`, `MessageDeliveryFailed`, `MessageBounced`, `MessageHeld`.
 
+## Uptime monitoring
+
+A public watchdog endpoint reports deep health — a real database read, the email provider, the send-queue cron heartbeat, and whether queued sends are stuck:
+
+```
+GET /_emdash/api/plugins/emdash-mailing-list/health
+→ {"success":true,"data":{"status":"healthy","checks":{"database":"up","email_provider":"configured","cron_age_seconds":42,"cron":"beating","queued_sends":0}}}
+```
+
+`status` is `"healthy"` only when every check passes (`"degraded"` otherwise, including when the cron hasn't ticked in 5 minutes — the failure mode that silently stalls blasts). Point a keyword monitor (UptimeRobot, etc.) at the URL and alert when the response **doesn't** contain `healthy`.
+
 ## Notes & limits
 
 - Batch size defaults to 25 sends/minute (configurable 1–100) to stay friendly to Workers subrequest limits and your mail server.
