@@ -214,6 +214,28 @@ async function gatherExtraData(ctx, filters) {
 	}
 	return map;
 }
+/**
+* RFC 8058 one-click unsubscribe headers.
+*
+* Gmail and Yahoo have required these of bulk senders since February 2024, and
+* Apple weights them too — without them a blast looks like unsolicited mail no
+* matter how well the domain authenticates.
+*
+* The URI points at the plugin's own API route rather than the human-facing
+* page: one-click sends an unattended POST, so the target has to unsubscribe
+* server-side without rendering anything or asking for confirmation. That route
+* accepts the token from either the query string or the body, so the same URL
+* serves both the POST and anyone who simply clicks it.
+*/
+async function unsubscribeHeaders(ctx, token) {
+	if (!token) return void 0;
+	const origin = await getOrigin(ctx);
+	if (!origin) return void 0;
+	return {
+		"List-Unsubscribe": `<${`${origin}/_emdash/api/plugins/emdash-mailing-list/unsubscribe?token=${encodeURIComponent(token)}`}>`,
+		"List-Unsubscribe-Post": "List-Unsubscribe=One-Click"
+	};
+}
 async function pagePath(ctx, kind) {
 	const key = kind === "confirm" ? "settings:confirmPath" : "settings:unsubscribePath";
 	return await ctx.kv.get(key) ?? `/mailing/${kind}`;
@@ -453,7 +475,8 @@ async function processQueue(ctx) {
 				to: send.email,
 				subject: rendered.subject,
 				text: rendered.text,
-				html: rendered.html
+				html: rendered.html,
+				headers: await unsubscribeHeaders(ctx, sub.token)
 			});
 			await sendsStore(ctx).put(id, {
 				...send,
@@ -1309,18 +1332,20 @@ Sent from the website contact form. Reply goes to the sender; they received a co
 				try {
 					if (testTo) {
 						if (!ctx.email) throw new Error("No email provider is configured");
-						const rendered = await renderEmail(ctx, subject, body, {
+						const testSub = {
 							email: testTo,
 							subscription: "confirmed",
 							blocked: false,
 							token: "test",
 							soft_fails: 0
-						});
+						};
+						const rendered = await renderEmail(ctx, subject, body, testSub);
 						await ctx.email.send({
 							to: testTo,
 							subject: `[TEST] ${rendered.subject}`,
 							text: rendered.text,
-							html: rendered.html
+							html: rendered.html,
+							headers: await unsubscribeHeaders(ctx, testSub.token)
 						});
 						return adminWithToast(ctx, `Test sent to ${testTo}`, "success");
 					}

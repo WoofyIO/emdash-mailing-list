@@ -305,6 +305,33 @@ async function gatherExtraData(
 	return map;
 }
 
+/**
+ * RFC 8058 one-click unsubscribe headers.
+ *
+ * Gmail and Yahoo have required these of bulk senders since February 2024, and
+ * Apple weights them too — without them a blast looks like unsolicited mail no
+ * matter how well the domain authenticates.
+ *
+ * The URI points at the plugin's own API route rather than the human-facing
+ * page: one-click sends an unattended POST, so the target has to unsubscribe
+ * server-side without rendering anything or asking for confirmation. That route
+ * accepts the token from either the query string or the body, so the same URL
+ * serves both the POST and anyone who simply clicks it.
+ */
+async function unsubscribeHeaders(
+	ctx: PluginContext,
+	token: string,
+): Promise<Record<string, string> | undefined> {
+	if (!token) return undefined;
+	const origin = await getOrigin(ctx);
+	if (!origin) return undefined;
+	const url = `${origin}/_emdash/api/plugins/emdash-mailing-list/unsubscribe?token=${encodeURIComponent(token)}`;
+	return {
+		"List-Unsubscribe": `<${url}>`,
+		"List-Unsubscribe-Post": "List-Unsubscribe=One-Click",
+	};
+}
+
 async function pagePath(ctx: PluginContext, kind: "confirm" | "unsubscribe"): Promise<string> {
 	const key = kind === "confirm" ? "settings:confirmPath" : "settings:unsubscribePath";
 	return (await ctx.kv.get<string>(key)) ?? `/mailing/${kind}`;
@@ -613,7 +640,13 @@ async function processQueue(ctx: PluginContext): Promise<void> {
 			// primary record, so custom fields work as merge tags.
 			const mergedSub = { ...(extras.get(send.email) ?? {}), ...sub } as SubscriberData;
 			const rendered = await renderEmail(ctx, blast.subject, blast.body, mergedSub);
-			await ctx.email.send({ to: send.email, subject: rendered.subject, text: rendered.text, html: rendered.html });
+			await ctx.email.send({
+				to: send.email,
+				subject: rendered.subject,
+				text: rendered.text,
+				html: rendered.html,
+				headers: await unsubscribeHeaders(ctx, sub.token),
+			} as Parameters<NonNullable<PluginContext["email"]>["send"]>[0]);
 			await sendsStore(ctx).put(id, { ...send, status: "sent", sentAt: now() });
 			blast.sent += 1;
 		} catch (error) {
@@ -1408,12 +1441,15 @@ Sent from the website contact form. Reply goes to the sender; they received a co
 								soft_fails: 0,
 							};
 							const rendered = await renderEmail(ctx, subject, body, testSub);
+							// Carry the same headers a real blast would, so a test
+							// actually exercises what recipients will receive.
 							await ctx.email.send({
 								to: testTo,
 								subject: `[TEST] ${rendered.subject}`,
 								text: rendered.text,
 								html: rendered.html,
-							});
+								headers: await unsubscribeHeaders(ctx, testSub.token),
+							} as Parameters<NonNullable<PluginContext["email"]>["send"]>[0]);
 							return adminWithToast(ctx, `Test sent to ${testTo}`, "success");
 						}
 						await ensureCron(ctx);
