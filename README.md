@@ -27,7 +27,9 @@ The **Source collections** setting takes a comma-separated list. The first is th
 - **Double opt-in** — subscribers confirm via an emailed link before receiving blasts
 - **Unsubscribe** — tokenized one-click link appended to every blast automatically
 - **Blasts** — Markdown compose (`**bold**`, `*italic*`, `[links](…)`, `#` headings, `-` lists), `{{merge_tags}}`, queued and sent in rate-limited batches with live sent/delivered/failed/bounced counts
-- **Targeting** — per-collection recipient filters at compose time (`attendees: year=2026, void=false` — works on the subscribers list too), an include/exclude toggle for the primary list, and an **Evaluate** mode that shows exactly who would receive the blast (email, source, state) without sending anything
+- **Targeting** — **checkboxes, not syntax**: one per source collection, plus one per value of that collection's group field (set **Checkbox targeting** to e.g. `attendees:event` and every event becomes a tickbox with a recipient count). Untick a source to exclude it entirely. An **Advanced filter** box still accepts the raw `attendees: year=2026, void=false` syntax and is ANDed on top, and **Evaluate** mode shows exactly who would receive the blast (email, source, state) without sending anything.
+
+  Ticking a subset of the group values ORs them, so "everyone who came to the first event but not the second" is two clicks. Filters for the same field are ORed; different fields are ANDed.
 - **HTML template** — paste your site's email shell in settings; `{{content}}` receives the rendered message (also available: `{{subject}}`, `{{unsubscribe_url}}`, `{{list_name}}`). Leave empty for a clean default.
 - **Subscriber management** — per-row **Confirm / Block / Unblock / Delete** actions in the admin, plus manual add
 - **Bounce handling** — Postal webhook: hard bounces **block** the address (kept on the list for audit, never emailed), three soft failures do the same, `MessageSent` upgrades sends to *delivered*. Blocking is reversible with one click.
