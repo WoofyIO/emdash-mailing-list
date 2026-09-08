@@ -585,6 +585,10 @@ async function enqueueBlast(ctx, subject, body, filtersRaw = "", includePrimary 
 		delivered: 0,
 		failed: 0,
 		bounced: 0,
+		opened: 0,
+		clicked: 0,
+		delayed: 0,
+		held: 0,
 		createdAt: now()
 	});
 	return {
@@ -593,6 +597,11 @@ async function enqueueBlast(ctx, subject, body, filtersRaw = "", includePrimary 
 	};
 }
 async function handlePostalEvent(ctx, event, payload) {
+	if (event === "DomainDNSError") {
+		const domain = String(payload?.domain ?? "unknown");
+		ctx.log.error(`Postal reports a DNS problem for ${domain}`, payload);
+		return `dns error recorded: ${domain}`;
+	}
 	const email = normalizeEmail((payload?.message ?? payload?.original_message ?? payload)?.to);
 	if (!email) return "ignored: no recipient";
 	const entry = await findByEmail(ctx, email);
@@ -615,6 +624,28 @@ async function handlePostalEvent(ctx, event, payload) {
 			await blasts(ctx).put(sendRow.data.blastId, blast);
 		}
 	};
+	const markEngagement = async (kind) => {
+		if (!sendRow) return false;
+		const stamp = kind === "opened" ? "openedAt" : "clickedAt";
+		if (sendRow.data[stamp]) return false;
+		await sendsStore(ctx).put(sendRow.id, {
+			...sendRow.data,
+			[stamp]: now()
+		});
+		const blast = await blasts(ctx).get(sendRow.data.blastId);
+		if (blast) {
+			blast[kind] = (blast[kind] ?? 0) + 1;
+			await blasts(ctx).put(sendRow.data.blastId, blast);
+		}
+		return true;
+	};
+	const bumpBlast = async (field) => {
+		if (!sendRow) return;
+		const blast = await blasts(ctx).get(sendRow.data.blastId);
+		if (!blast) return;
+		blast[field] = (blast[field] ?? 0) + 1;
+		await blasts(ctx).put(sendRow.data.blastId, blast);
+	};
 	const block = async (reason) => {
 		if (entry && !entry.data.blocked) await upsertSubscriber(ctx, email, {
 			blocked: true,
@@ -625,6 +656,14 @@ async function handlePostalEvent(ctx, event, payload) {
 		case "MessageSent":
 			await applySendStatus("delivered");
 			return `delivered: ${email}`;
+		case "MessageLoaded": return await markEngagement("opened") ? `opened: ${email}` : `opened again (not recounted): ${email}`;
+		case "MessageLinkClicked":
+			await markEngagement("opened");
+			return await markEngagement("clicked") ? `clicked: ${email}` : `clicked again (not recounted): ${email}`;
+		case "MessageDelayed":
+			await bumpBlast("delayed");
+			await applySendStatus("delayed", String(payload?.details ?? "delayed, will retry").slice(0, 200));
+			return `delayed (will retry): ${email}`;
 		case "MessageBounced":
 			await applySendStatus("bounced", "bounced");
 			await block("bounce received");
@@ -878,6 +917,10 @@ async function buildAdminPage(ctx, preview) {
 			text: "Blasts"
 		},
 		{
+			type: "context",
+			text: "Opens and clicks are unique recipients, counted once each, as a percentage of delivered. They arrive from Postal webhooks, so they need the webhook configured with MessageLoaded and MessageLinkClicked enabled — and open tracking is always an undercount, since many clients block the tracking pixel."
+		},
+		{
 			type: "table",
 			page_action_id: "blasts_page",
 			empty_text: "No blasts sent yet.",
@@ -899,12 +942,16 @@ async function buildAdminPage(ctx, preview) {
 					label: "Delivered"
 				},
 				{
-					key: "failed",
-					label: "Failed"
+					key: "opened",
+					label: "Opened"
 				},
 				{
-					key: "bounced",
-					label: "Bounced"
+					key: "clicked",
+					label: "Clicked"
+				},
+				{
+					key: "problems",
+					label: "Failed / Bounced"
 				},
 				{
 					key: "createdAt",
@@ -912,15 +959,23 @@ async function buildAdminPage(ctx, preview) {
 					format: "relative_time"
 				}
 			],
-			rows: recentBlasts.items.map(({ data: b }) => ({
-				subject: b.subject,
-				status: b.status,
-				progress: `${b.sent}/${b.total}`,
-				delivered: String(b.delivered),
-				failed: String(b.failed),
-				bounced: String(b.bounced),
-				createdAt: b.createdAt
-			}))
+			rows: recentBlasts.items.map(({ data: b }) => {
+				const base = b.delivered || b.sent || 0;
+				const pct = (n) => base > 0 ? ` (${Math.round(n / base * 100)}%)` : "";
+				const opened = b.opened ?? 0;
+				const clicked = b.clicked ?? 0;
+				const stalled = (b.delayed ?? 0) + (b.held ?? 0);
+				return {
+					subject: b.subject,
+					status: b.status,
+					progress: `${b.sent}/${b.total}`,
+					delivered: String(b.delivered),
+					opened: `${opened}${pct(opened)}`,
+					clicked: `${clicked}${pct(clicked)}`,
+					problems: `${b.failed} / ${b.bounced}${stalled ? ` (${stalled} delayed)` : ""}`,
+					createdAt: b.createdAt
+				};
+			})
 		},
 		{
 			type: "header",
