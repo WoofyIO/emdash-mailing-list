@@ -380,6 +380,7 @@ interface Queued {
 	subject: string;
 	text: string;
 	html: string;
+	replyTo?: string;
 	createdAt: string;
 	attempts?: number;
 }
@@ -639,7 +640,13 @@ async function processOutbox(ctx: PluginContext): Promise<void> {
 	for (const item of pending.items) {
 		const d = item.data;
 		try {
-			await ctx.email.send({ to: d.to, subject: d.subject, text: d.text, html: d.html });
+			await ctx.email.send({
+				to: d.to,
+				subject: d.subject,
+				text: d.text,
+				html: d.html,
+				...(d.replyTo ? { replyTo: d.replyTo } : {}),
+			} as Parameters<NonNullable<PluginContext["email"]>["send"]>[0]);
 			await outbox(ctx).delete(item.id);
 		} catch (error) {
 			const attempts = (d.attempts ?? 0) + 1;
@@ -1341,18 +1348,25 @@ Sent from the website contact form. Replying goes to the sender.`;
 <blockquote style="border-left:3px solid #ccc;margin:12px 0;padding:4px 12px;white-space:pre-wrap">${escapeHtml(message)}</blockquote>
 <p style="font-size:12px;color:#777">Sent from the website contact form. Replying goes to the sender.</p>`;
 
-				// The submitter is NOT copied on this. The address is unverified —
-				// anyone can type a third party's — so echoing attacker-supplied
-				// content to it would turn the form into a relay for sending
-				// arbitrary text to arbitrary people, and get the sending domain
-				// blocklisted. replyTo still makes replying one click.
-				await ctx.email.send({
+				// Both messages are queued, not sent here. A route gets a hard 5s
+				// and no waitUntil, while one Postal call measured 5.5s on its own
+				// — sending inline fails the request even when the mail goes out,
+				// which is the worst of both worlds.
+				//
+				// The submitter is NOT copied on the operator's message. Their
+				// address is unverified — anyone can type a third party's — so
+				// echoing attacker-supplied content to it would make the form a
+				// relay for arbitrary text to arbitrary people. replyTo still
+				// makes replying one click.
+				await outbox(ctx).put(`contact-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`, {
 					to: contactTo,
 					subject: fullSubject,
 					text,
 					html,
 					replyTo: email,
-				} as Parameters<NonNullable<PluginContext["email"]>["send"]>[0]);
+					createdAt: now(),
+					attempts: 0,
+				});
 
 				// Queue the submitter's acknowledgement rather than sending it here.
 				// A route has a fixed 5s budget and one Postal call can consume most

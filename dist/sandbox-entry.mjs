@@ -448,7 +448,8 @@ async function processOutbox(ctx) {
 				to: d.to,
 				subject: d.subject,
 				text: d.text,
-				html: d.html
+				html: d.html,
+				...d.replyTo ? { replyTo: d.replyTo } : {}
 			});
 			await outbox(ctx).delete(item.id);
 		} catch (error) {
@@ -1225,12 +1226,14 @@ Sent from the website contact form. Replying goes to the sender.`;
 <p>From: ${escapeHtml(name)} &lt;${escapeHtml(email)}&gt;<br>Subject: ${escapeHtml(subject || "(none)")}</p>
 <blockquote style="border-left:3px solid #ccc;margin:12px 0;padding:4px 12px;white-space:pre-wrap">${escapeHtml(message)}</blockquote>
 <p style="font-size:12px;color:#777">Sent from the website contact form. Replying goes to the sender.</p>`;
-				await ctx.email.send({
+				await outbox(ctx).put(`contact-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`, {
 					to: contactTo,
 					subject: fullSubject,
 					text,
 					html,
-					replyTo: email
+					replyTo: email,
+					createdAt: now(),
+					attempts: 0
 				});
 				await outbox(ctx).put(`ack-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`, {
 					to: email,
