@@ -32,6 +32,7 @@ The **Source collections** setting takes a comma-separated list. The first is th
   Ticking a subset of the group values ORs them, so "everyone who came to the first event but not the second" is two clicks. Filters for the same field are ORed; different fields are ANDed.
 - **HTML template** — paste your site's email shell in settings; `{{content}}` receives the rendered message (also available: `{{subject}}`, `{{unsubscribe_url}}`, `{{list_name}}`). Leave empty for a clean default.
 - **Subscriber management** — per-row **Confirm / Block / Unblock / Delete** actions in the admin, plus manual add
+- **Per-blast reporting** — delivered, unique opens and clicks (with rates against delivered), failures, bounces and delayed counts, per blast in the admin. Opens and clicks are de-duplicated per recipient, and a click also counts as an open since pixel blocking is common.
 - **Bounce handling** — Postal webhook: hard bounces **block** the address (kept on the list for audit, never emailed), three soft failures do the same, `MessageSent` upgrades sends to *delivered*. Blocking is reversible with one click.
 
 ## Install
@@ -68,6 +69,21 @@ Create the subscribers collection (seed snippet — or build it in the admin sch
   ]
 }
 ```
+
+### Postal webhook events
+
+Point Postal's webhook at the plugin and enable **all** events — the plugin uses
+each one:
+
+| Event | Effect |
+| --- | --- |
+| `MessageSent` | send marked *delivered* |
+| `MessageLoaded` | unique open |
+| `MessageLinkClicked` | unique click (also counts as an open) |
+| `MessageDelayed` | recorded, will retry — no suppression |
+| `MessageDeliveryFailed` / `MessageHeld` | hard fail blocks; soft fails block after three |
+| `MessageBounced` | blocks the address |
+| `DomainDNSError` | logged against the domain |
 
 Open **Admin → Mailing List** once after deploying — the first page load provisions the send-queue cron and webhook secret, and migrates any v0.1 plugin-storage subscribers into the collection.
 

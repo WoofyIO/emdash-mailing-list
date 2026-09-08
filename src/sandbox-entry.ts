@@ -54,6 +54,11 @@ interface Blast {
 	delivered: number;
 	failed: number;
 	bounced: number;
+	/** Unique recipients, not raw events — one person opening five times counts once. */
+	opened: number;
+	clicked: number;
+	delayed: number;
+	held: number;
 	createdAt: string;
 	completedAt?: string;
 }
@@ -61,10 +66,13 @@ interface Blast {
 interface Send {
 	blastId: string;
 	email: string;
-	status: "queued" | "sent" | "delivered" | "failed" | "bounced";
+	status: "queued" | "sent" | "delivered" | "failed" | "bounced" | "delayed" | "held";
 	error?: string;
 	createdAt: string;
 	sentAt?: string;
+	/** First open / first click. Presence is what de-duplicates the counters. */
+	openedAt?: string;
+	clickedAt?: string;
 }
 
 // ————————————————————————————————— helpers —————————————————————————————————
@@ -303,6 +311,33 @@ async function gatherExtraData(
 		}
 	}
 	return map;
+}
+
+/**
+ * RFC 8058 one-click unsubscribe headers.
+ *
+ * Gmail and Yahoo have required these of bulk senders since February 2024, and
+ * Apple weights them too — without them a blast looks like unsolicited mail no
+ * matter how well the domain authenticates.
+ *
+ * The URI points at the plugin's own API route rather than the human-facing
+ * page: one-click sends an unattended POST, so the target has to unsubscribe
+ * server-side without rendering anything or asking for confirmation. That route
+ * accepts the token from either the query string or the body, so the same URL
+ * serves both the POST and anyone who simply clicks it.
+ */
+async function unsubscribeHeaders(
+	ctx: PluginContext,
+	token: string,
+): Promise<Record<string, string> | undefined> {
+	if (!token) return undefined;
+	const origin = await getOrigin(ctx);
+	if (!origin) return undefined;
+	const url = `${origin}/_emdash/api/plugins/emdash-mailing-list/unsubscribe?token=${encodeURIComponent(token)}`;
+	return {
+		"List-Unsubscribe": `<${url}>`,
+		"List-Unsubscribe-Post": "List-Unsubscribe=One-Click",
+	};
 }
 
 async function pagePath(ctx: PluginContext, kind: "confirm" | "unsubscribe"): Promise<string> {
@@ -613,7 +648,13 @@ async function processQueue(ctx: PluginContext): Promise<void> {
 			// primary record, so custom fields work as merge tags.
 			const mergedSub = { ...(extras.get(send.email) ?? {}), ...sub } as SubscriberData;
 			const rendered = await renderEmail(ctx, blast.subject, blast.body, mergedSub);
-			await ctx.email.send({ to: send.email, subject: rendered.subject, text: rendered.text, html: rendered.html });
+			await ctx.email.send({
+				to: send.email,
+				subject: rendered.subject,
+				text: rendered.text,
+				html: rendered.html,
+				headers: await unsubscribeHeaders(ctx, sub.token),
+			} as Parameters<NonNullable<PluginContext["email"]>["send"]>[0]);
 			await sendsStore(ctx).put(id, { ...send, status: "sent", sentAt: now() });
 			blast.sent += 1;
 		} catch (error) {
@@ -731,6 +772,10 @@ async function enqueueBlast(
 		delivered: 0,
 		failed: 0,
 		bounced: 0,
+		opened: 0,
+		clicked: 0,
+		delayed: 0,
+		held: 0,
 		createdAt: now(),
 	});
 	return { blastId, total: recipients.length };
@@ -739,6 +784,14 @@ async function enqueueBlast(
 // —————————————————————————————— webhook events ——————————————————————————————
 
 async function handlePostalEvent(ctx: PluginContext, event: string, payload: Record<string, unknown>): Promise<string> {
+	// DomainDNSError is server-scoped, not tied to a recipient, so it has to be
+	// handled before the per-recipient lookup below.
+	if (event === "DomainDNSError") {
+		const domain = String(payload?.domain ?? "unknown");
+		ctx.log.error(`Postal reports a DNS problem for ${domain}`, payload);
+		return `dns error recorded: ${domain}`;
+	}
+
 	const message = (payload?.message ?? payload?.original_message ?? payload) as Record<string, unknown> | undefined;
 	const email = normalizeEmail(message?.to);
 	if (!email) return "ignored: no recipient";
@@ -759,6 +812,30 @@ async function handlePostalEvent(ctx: PluginContext, event: string, payload: Rec
 		}
 	};
 
+	// Opens and clicks are counted per recipient, not per event: mail clients
+	// re-fetch images and people click twice, and a blast whose "opened" exceeds
+	// its "sent" is worse than useless.
+	const markEngagement = async (kind: "opened" | "clicked") => {
+		if (!sendRow) return false;
+		const stamp = kind === "opened" ? "openedAt" : "clickedAt";
+		if (sendRow.data[stamp]) return false;
+		await sendsStore(ctx).put(sendRow.id, { ...sendRow.data, [stamp]: now() });
+		const blast = await blasts(ctx).get(sendRow.data.blastId);
+		if (blast) {
+			blast[kind] = (blast[kind] ?? 0) + 1;
+			await blasts(ctx).put(sendRow.data.blastId, blast);
+		}
+		return true;
+	};
+
+	const bumpBlast = async (field: "delayed" | "held") => {
+		if (!sendRow) return;
+		const blast = await blasts(ctx).get(sendRow.data.blastId);
+		if (!blast) return;
+		blast[field] = (blast[field] ?? 0) + 1;
+		await blasts(ctx).put(sendRow.data.blastId, blast);
+	};
+
 	const block = async (reason: string) => {
 		if (entry && !entry.data.blocked) {
 			await upsertSubscriber(ctx, email, { blocked: true, bounce_reason: reason });
@@ -769,6 +846,23 @@ async function handlePostalEvent(ctx: PluginContext, event: string, payload: Rec
 		case "MessageSent":
 			await applySendStatus("delivered");
 			return `delivered: ${email}`;
+
+		case "MessageLoaded": {
+			const first = await markEngagement("opened");
+			return first ? `opened: ${email}` : `opened again (not recounted): ${email}`;
+		}
+
+		case "MessageLinkClicked": {
+			// A click implies an open even when the tracking pixel was blocked.
+			await markEngagement("opened");
+			const first = await markEngagement("clicked");
+			return first ? `clicked: ${email}` : `clicked again (not recounted): ${email}`;
+		}
+
+		case "MessageDelayed":
+			await bumpBlast("delayed");
+			await applySendStatus("delayed", String(payload?.details ?? "delayed, will retry").slice(0, 200));
+			return `delayed (will retry): ${email}`;
 
 		case "MessageBounced":
 			await applySendStatus("bounced", "bounced");
@@ -991,6 +1085,10 @@ async function buildAdminPage(
 
 			{ type: "header", text: "Blasts" },
 			{
+				type: "context",
+				text: "Opens and clicks are unique recipients, counted once each, as a percentage of delivered. They arrive from Postal webhooks, so they need the webhook configured with MessageLoaded and MessageLinkClicked enabled — and open tracking is always an undercount, since many clients block the tracking pixel.",
+			},
+			{
 				type: "table",
 				page_action_id: "blasts_page",
 				empty_text: "No blasts sent yet.",
@@ -999,19 +1097,31 @@ async function buildAdminPage(
 					{ key: "status", label: "Status" },
 					{ key: "progress", label: "Sent" },
 					{ key: "delivered", label: "Delivered" },
-					{ key: "failed", label: "Failed" },
-					{ key: "bounced", label: "Bounced" },
+					{ key: "opened", label: "Opened" },
+					{ key: "clicked", label: "Clicked" },
+					{ key: "problems", label: "Failed / Bounced" },
 					{ key: "createdAt", label: "Created", format: "relative_time" },
 				],
-				rows: recentBlasts.items.map(({ data: b }) => ({
-					subject: b.subject,
-					status: b.status,
-					progress: `${b.sent}/${b.total}`,
-					delivered: String(b.delivered),
-					failed: String(b.failed),
-					bounced: String(b.bounced),
-					createdAt: b.createdAt,
-				})),
+				rows: recentBlasts.items.map(({ data: b }) => {
+					// Rates are against delivered, not sent: a message that never
+					// arrived can't be opened, and dividing by sent quietly
+					// understates engagement whenever anything bounces.
+					const base = b.delivered || b.sent || 0;
+					const pct = (n: number) => (base > 0 ? ` (${Math.round((n / base) * 100)}%)` : "");
+					const opened = b.opened ?? 0;
+					const clicked = b.clicked ?? 0;
+					const stalled = (b.delayed ?? 0) + (b.held ?? 0);
+					return {
+						subject: b.subject,
+						status: b.status,
+						progress: `${b.sent}/${b.total}`,
+						delivered: String(b.delivered),
+						opened: `${opened}${pct(opened)}`,
+						clicked: `${clicked}${pct(clicked)}`,
+						problems: `${b.failed} / ${b.bounced}${stalled ? ` (${stalled} delayed)` : ""}`,
+						createdAt: b.createdAt,
+					};
+				}),
 			},
 
 			{ type: "header", text: `Subscribers (latest ${recent.length} of ${all.length})` },
@@ -1408,12 +1518,15 @@ Sent from the website contact form. Reply goes to the sender; they received a co
 								soft_fails: 0,
 							};
 							const rendered = await renderEmail(ctx, subject, body, testSub);
+							// Carry the same headers a real blast would, so a test
+							// actually exercises what recipients will receive.
 							await ctx.email.send({
 								to: testTo,
 								subject: `[TEST] ${rendered.subject}`,
 								text: rendered.text,
 								html: rendered.html,
-							});
+								headers: await unsubscribeHeaders(ctx, testSub.token),
+							} as Parameters<NonNullable<PluginContext["email"]>["send"]>[0]);
 							return adminWithToast(ctx, `Test sent to ${testTo}`, "success");
 						}
 						await ensureCron(ctx);
