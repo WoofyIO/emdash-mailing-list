@@ -1379,14 +1379,11 @@ Sent from the website contact form. Replying goes to the sender.`;
 				await outbox(ctx).put(`ack-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`, {
 					to: email,
 					subject: "We got your message",
-					text: `Thanks for getting in touch.
+					text: `Thanks for getting in touch — we've got your message and will reply soon.
 
-We've received your message and someone will reply soon.
-
-You're getting this because this address was entered into the contact form on our website. If that wasn't you, no action is needed — nothing has been signed up or changed, and we won't email you again about it.`,
-					html: `<p>Thanks for getting in touch.</p>
-<p>We've received your message and someone will reply soon.</p>
-<p style="font-size:12px;color:#777">You're getting this because this address was entered into the contact form on our website. If that wasn't you, no action is needed — nothing has been signed up or changed, and we won't email you again about it.</p>`,
+This is an automated confirmation. If you didn't contact us, you can ignore it.`,
+					html: `<p>Thanks for getting in touch — we've got your message and will reply soon.</p>
+<p style="font-size:12px;color:#777">This is an automated confirmation. If you didn't contact us, you can ignore it.</p>`,
 					createdAt: now(),
 					attempts: 0,
 				});
