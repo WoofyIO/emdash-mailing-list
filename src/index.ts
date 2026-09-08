@@ -16,7 +16,7 @@ import type { PluginDescriptor } from "emdash";
 export function emdashMailingList(): PluginDescriptor {
 	return {
 		id: "emdash-mailing-list",
-		version: "0.3.2",
+		version: "0.4.0",
 		format: "standard",
 		entrypoint: "emdash-mailing-list/sandbox",
 		options: {},
