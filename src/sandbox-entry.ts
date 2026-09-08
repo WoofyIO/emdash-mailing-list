@@ -125,6 +125,98 @@ async function getCollections(ctx: PluginContext): Promise<string[]> {
 	return slugs.length > 0 ? slugs : ["subscribers"];
 }
 
+/**
+ * Which field of a source collection becomes a row of checkboxes in the
+ * compose form, e.g. "attendees:event" so staff can target the people who
+ * came to particular events. Comma-separated collection:field pairs.
+ */
+async function getGroupFields(ctx: PluginContext): Promise<Map<string, string>> {
+	const raw = (await ctx.kv.get<string>("settings:groupFields")) ?? "";
+	const map = new Map<string, string>();
+	for (const part of raw.split(",")) {
+		const m = part.match(/^\s*([a-z][a-z0-9_]*)\s*:\s*([a-zA-Z0-9_]+)\s*$/i);
+		if (m) map.set(m[1].toLowerCase(), m[2]);
+	}
+	return map;
+}
+
+/** Distinct values of each configured group field, with how many entries carry each. */
+async function gatherGroupValues(ctx: PluginContext): Promise<Map<string, Array<{ value: string; count: number }>>> {
+	const groupFields = await getGroupFields(ctx);
+	const out = new Map<string, Array<{ value: string; count: number }>>();
+	if (groupFields.size === 0) return out;
+	const api = contentApi(ctx);
+	for (const [collection, field] of groupFields) {
+		const counts = new Map<string, number>();
+		try {
+			let cursor: string | undefined;
+			do {
+				const page = await api.list(collection, { limit: 100, cursor });
+				for (const entry of page.items) {
+					const raw = (entry.data as Record<string, unknown>)?.[field];
+					if (raw === undefined || raw === null || raw === "") continue;
+					const value = String(raw);
+					counts.set(value, (counts.get(value) ?? 0) + 1);
+				}
+				cursor = page.hasMore ? page.cursor : undefined;
+			} while (cursor);
+		} catch (error) {
+			ctx.log.error(`Mailing list: cannot read group field "${field}" on "${collection}"`, error);
+			continue;
+		}
+		if (counts.size > 0) {
+			out.set(
+				collection,
+				[...counts.entries()].map(([value, count]) => ({ value, count })).sort((a, b) => a.value.localeCompare(b.value)),
+			);
+		}
+	}
+	return out;
+}
+
+/**
+ * Translate the compose form's checkboxes back into the filter syntax the
+ * resolver already understands, then append any advanced lines. An extra
+ * source with every group box ticked stays unfiltered; with none ticked it is
+ * excluded entirely; a partial selection becomes an OR over those values.
+ */
+async function filtersFromSelection(
+	ctx: PluginContext,
+	values: Record<string, unknown>,
+	advanced: string,
+): Promise<string> {
+	const [, ...extras] = await getCollections(ctx);
+	const groupFields = await getGroupFields(ctx);
+	const groupValues = await gatherGroupValues(ctx);
+	const lines: string[] = [];
+
+	for (const extra of extras) {
+		// Unticking the source itself excludes it: an impossible filter is the
+		// only way to say "none of these" in the existing engine.
+		if (values[srcActionId(extra)] === false) {
+			lines.push(`${extra}: __excluded__=true`);
+			continue;
+		}
+		const field = groupFields.get(extra);
+		const options = groupValues.get(extra) ?? [];
+		if (!field || options.length === 0) continue;
+		const chosen = options.filter((o) => values[grpActionId(extra, o.value)] !== false);
+		if (chosen.length === options.length) continue; // all ticked = unfiltered
+		if (chosen.length === 0) {
+			lines.push(`${extra}: __excluded__=true`);
+			continue;
+		}
+		lines.push(`${extra}: ${chosen.map((o) => `${field}=${o.value}`).join(", ")}`);
+	}
+
+	return [...lines, advanced.trim()].filter(Boolean).join("\n");
+}
+
+/** Stable, round-trippable action_ids for the generated checkboxes. */
+const srcActionId = (collection: string) => `src__${collection}`;
+const grpActionId = (collection: string, value: string) =>
+	`grp__${collection}__${value.replace(/[^a-zA-Z0-9_-]/g, "-")}`;
+
 async function getCollection(ctx: PluginContext): Promise<string> {
 	return (await getCollections(ctx))[0];
 }
@@ -152,16 +244,32 @@ function parseFilters(raw: string): RecipientFilters {
 	return filters;
 }
 
+function matchesOne(actual: unknown, expected: string): boolean {
+	const exp = expected.toLowerCase();
+	if (exp === "true" || exp === "false") return Boolean(actual) === (exp === "true");
+	if (actual === undefined || actual === null) return exp === "";
+	if (typeof actual === "number" && !Number.isNaN(Number(expected))) return actual === Number(expected);
+	return String(actual).toLowerCase() === exp;
+}
+
+/**
+ * Pairs for the same key are ORed, different keys are ANDed — so
+ * "event=spring, event=summer, void=false" means
+ * (event IN (spring, summer)) AND void = false. A single value per key
+ * behaves exactly as it did before this was added.
+ */
 function matchesFilter(data: Record<string, unknown>, pairs: Array<[string, string]> | undefined): boolean {
 	if (!pairs) return true;
-	return pairs.every(([key, expected]) => {
-		const actual = data[key];
-		const exp = expected.toLowerCase();
-		if (exp === "true" || exp === "false") return Boolean(actual) === (exp === "true");
-		if (actual === undefined || actual === null) return exp === "";
-		if (typeof actual === "number" && !Number.isNaN(Number(expected))) return actual === Number(expected);
-		return String(actual).toLowerCase() === exp;
-	});
+	const byKey = new Map<string, string[]>();
+	for (const [key, expected] of pairs) {
+		const list = byKey.get(key) ?? [];
+		list.push(expected);
+		byKey.set(key, list);
+	}
+	for (const [key, expectations] of byKey) {
+		if (!expectations.some((exp) => matchesOne(data[key], exp))) return false;
+	}
+	return true;
 }
 
 /**
@@ -739,6 +847,8 @@ async function buildAdminPage(
 	const listName = await getListName(ctx);
 	const batchSize = (await ctx.kv.get<number>("settings:batchSize")) ?? 25;
 	const template = (await ctx.kv.get<string>("settings:template")) ?? "";
+	const [, ...extraCollections] = await getCollections(ctx);
+	const groupValues = await gatherGroupValues(ctx);
 	const collectionsCsv = (await getCollections(ctx)).join(", ");
 	const webhookUrl = `${origin || "https://<your-site>"}/_emdash/api/plugins/emdash-mailing-list/webhook?key=${secret}`;
 	const subscribeUrl = `${origin || "https://<your-site>"}/_emdash/api/plugins/emdash-mailing-list/subscribe`;
@@ -808,15 +918,32 @@ async function buildAdminPage(
 					{
 						type: "toggle",
 						action_id: "include_primary",
-						label: "Include the subscribers list (untick to target only the extra source collections)",
+						label: `Send to the ${collection} list (everyone who signed up)`,
 						initial_value: true,
 					},
+					// One checkbox per extra source, then one per value of that
+					// source's group field — so targeting "people who came to
+					// the first event but not the second" is all ticking boxes.
+					...extraCollections.flatMap((extra) => [
+						{
+							type: "toggle" as const,
+							action_id: srcActionId(extra),
+							label: `Send to ${extra}`,
+							initial_value: true,
+						},
+						...(groupValues.get(extra) ?? []).map((g) => ({
+							type: "toggle" as const,
+							action_id: grpActionId(extra, g.value),
+							label: `   ↳ ${extra}: ${g.value} (${g.count})`,
+							initial_value: true,
+						})),
+					]),
 					{
 						type: "text_input",
 						action_id: "filters",
-						label: "Recipient filter (optional) — one line per collection, e.g. “attendees: year=2026, void=false”. Works for the subscribers list too. Unlisted collections are unfiltered.",
+						label: "Advanced filter (optional) — one line per collection, e.g. “attendees: year=2026, void=false”. Added on top of the checkboxes above.",
 						multiline: true,
-						placeholder: "attendees: year=2026, void=false",
+						placeholder: "attendees: void=false",
 					},
 					{
 						type: "toggle",
@@ -926,6 +1053,13 @@ async function buildAdminPage(
 						action_id: "collections",
 						label: "Source collections (comma-separated; first is the primary list, extras like an attendees collection just need an email field)",
 						initial_value: collectionsCsv,
+					},
+					{
+						type: "text_input",
+						action_id: "groupFields",
+						label: "Checkbox targeting (optional) — comma-separated collection:field pairs, e.g. “attendees:event”. Each distinct value of that field becomes a checkbox in the compose form.",
+						initial_value: (await ctx.kv.get<string>("settings:groupFields")) ?? "",
+						placeholder: "attendees:event",
 					},
 					{
 						type: "text_input",
@@ -1223,6 +1357,9 @@ Sent from the website contact form. Reply goes to the sender; they received a co
 					if (typeof values.collections === "string" && values.collections.trim()) {
 						await ctx.kv.set("settings:collections", values.collections.trim());
 					}
+					if (typeof values.groupFields === "string") {
+						await ctx.kv.set("settings:groupFields", values.groupFields.trim());
+					}
 					if (typeof values.contactTo === "string") {
 						await ctx.kv.set("settings:contactTo", values.contactTo.trim());
 					}
@@ -1241,8 +1378,9 @@ Sent from the website contact form. Reply goes to the sender; they received a co
 					const subject = typeof values.subject === "string" ? values.subject.trim() : "";
 					const body = typeof values.body === "string" ? values.body.trim() : "";
 					const testTo = normalizeEmail(values.test_to);
-					const filtersRaw = typeof values.filters === "string" ? values.filters : "";
+					const advancedFilters = typeof values.filters === "string" ? values.filters : "";
 					const includePrimary = values.include_primary !== false;
+					const filtersRaw = await filtersFromSelection(ctx, values, advancedFilters);
 					const previewOnly = values.preview === true;
 
 					if (previewOnly) {
