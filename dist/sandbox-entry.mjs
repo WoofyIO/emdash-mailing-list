@@ -1185,19 +1185,34 @@ Subject: ${subject || "(none)"}
 ${message}
 
 —
-Sent from the website contact form. Reply goes to the sender; they received a copy (CC).`;
+Sent from the website contact form. Replying goes to the sender.`;
 				const html = `<p><strong>New contact form message</strong></p>
 <p>From: ${escapeHtml(name)} &lt;${escapeHtml(email)}&gt;<br>Subject: ${escapeHtml(subject || "(none)")}</p>
 <blockquote style="border-left:3px solid #ccc;margin:12px 0;padding:4px 12px;white-space:pre-wrap">${escapeHtml(message)}</blockquote>
-<p style="font-size:12px;color:#777">Sent from the website contact form. Reply goes to the sender; they received a copy (CC).</p>`;
+<p style="font-size:12px;color:#777">Sent from the website contact form. Replying goes to the sender.</p>`;
 				await ctx.email.send({
 					to: contactTo,
 					subject: fullSubject,
 					text,
 					html,
-					cc: email,
 					replyTo: email
 				});
+				try {
+					await ctx.email.send({
+						to: email,
+						subject: "We got your message",
+						text: `Thanks for getting in touch.
+
+We've received your message and someone will reply soon.
+
+You're getting this because this address was entered into the contact form on our website. If that wasn't you, no action is needed — nothing has been signed up or changed, and we won't email you again about it.`,
+						html: `<p>Thanks for getting in touch.</p>
+<p>We've received your message and someone will reply soon.</p>
+<p style="font-size:12px;color:#777">You're getting this because this address was entered into the contact form on our website. If that wasn't you, no action is needed — nothing has been signed up or changed, and we won't email you again about it.</p>`
+					});
+				} catch (error) {
+					ctx.log.error("Contact acknowledgement failed", error);
+				}
 				return { ok: true };
 			}
 		},
