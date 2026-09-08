@@ -256,6 +256,10 @@ function blasts(ctx) {
 function sendsStore(ctx) {
 	return ctx.storage.sends;
 }
+/** One-off transactional mail, sent by the cron rather than inline (see contact route). */
+function outbox(ctx) {
+	return ctx.storage.outbox;
+}
 function contentApi(ctx) {
 	if (!ctx.content) throw new Error("Missing content capability");
 	return ctx.content;
@@ -428,6 +432,36 @@ async function sendConfirmationEmail(ctx, sub) {
 		text: `Hi!\n\nSomeone (hopefully you) asked to join ${listName}.\n\nConfirm your subscription:\n${confirmUrl}\n\nIf this wasn't you, ignore this email and you won't hear from us again.`,
 		html: rendered.html
 	});
+}
+/**
+* Drain one-off transactional mail. Separate from the blast queue: these have no
+* blast to report against, and a permanently failing message is dropped after
+* three attempts rather than retried for ever.
+*/
+async function processOutbox(ctx) {
+	if (!ctx.email) return;
+	const pending = await outbox(ctx).query({ limit: 25 });
+	for (const item of pending.items) {
+		const d = item.data;
+		try {
+			await ctx.email.send({
+				to: d.to,
+				subject: d.subject,
+				text: d.text,
+				html: d.html
+			});
+			await outbox(ctx).delete(item.id);
+		} catch (error) {
+			const attempts = (d.attempts ?? 0) + 1;
+			if (attempts >= 3) {
+				ctx.log.error(`Giving up on queued mail to ${d.to} after 3 attempts`, error);
+				await outbox(ctx).delete(item.id);
+			} else await outbox(ctx).put(item.id, {
+				...d,
+				attempts
+			});
+		}
+	}
 }
 async function processQueue(ctx) {
 	const batchSize = await ctx.kv.get("settings:batchSize") ?? 25;
@@ -1108,6 +1142,7 @@ var sandbox_entry_default = definePlugin({
 		cron: { handler: async (event, ctx) => {
 			if (event.name === "process-queue") {
 				await ctx.kv.set("state:lastCron", now());
+				await processOutbox(ctx);
 				await processQueue(ctx);
 			}
 		} }
@@ -1197,22 +1232,21 @@ Sent from the website contact form. Replying goes to the sender.`;
 					html,
 					replyTo: email
 				});
-				try {
-					await ctx.email.send({
-						to: email,
-						subject: "We got your message",
-						text: `Thanks for getting in touch.
+				await outbox(ctx).put(`ack-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`, {
+					to: email,
+					subject: "We got your message",
+					text: `Thanks for getting in touch.
 
 We've received your message and someone will reply soon.
 
 You're getting this because this address was entered into the contact form on our website. If that wasn't you, no action is needed — nothing has been signed up or changed, and we won't email you again about it.`,
-						html: `<p>Thanks for getting in touch.</p>
+					html: `<p>Thanks for getting in touch.</p>
 <p>We've received your message and someone will reply soon.</p>
-<p style="font-size:12px;color:#777">You're getting this because this address was entered into the contact form on our website. If that wasn't you, no action is needed — nothing has been signed up or changed, and we won't email you again about it.</p>`
-					});
-				} catch (error) {
-					ctx.log.error("Contact acknowledgement failed", error);
-				}
+<p style="font-size:12px;color:#777">You're getting this because this address was entered into the contact form on our website. If that wasn't you, no action is needed — nothing has been signed up or changed, and we won't email you again about it.</p>`,
+					createdAt: now(),
+					attempts: 0
+				});
+				await ensureCron(ctx);
 				return { ok: true };
 			}
 		},

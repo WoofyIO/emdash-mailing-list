@@ -16,7 +16,7 @@ import type { PluginDescriptor } from "emdash";
 export function emdashMailingList(): PluginDescriptor {
 	return {
 		id: "emdash-mailing-list",
-		version: "0.6.0",
+		version: "0.6.1",
 		format: "standard",
 		entrypoint: "emdash-mailing-list/sandbox",
 		options: {},
@@ -33,6 +33,12 @@ export function emdashMailingList(): PluginDescriptor {
 			},
 			sends: {
 				indexes: ["blastId", "email", "status", "createdAt"],
+			},
+			// One-off transactional mail (e.g. contact acknowledgements) that must
+			// not be sent inline: a plugin route has a fixed 5s budget and a single
+			// Postal call can take most of it.
+			outbox: {
+				indexes: ["createdAt"],
 			},
 		},
 		adminPages: [{ path: "/mailing-list", label: "Mailing List", icon: "email" }],
