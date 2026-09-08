@@ -375,6 +375,24 @@ function sendsStore(ctx: PluginContext) {
 	};
 }
 
+interface Queued {
+	to: string;
+	subject: string;
+	text: string;
+	html: string;
+	createdAt: string;
+	attempts?: number;
+}
+
+/** One-off transactional mail, sent by the cron rather than inline (see contact route). */
+function outbox(ctx: PluginContext) {
+	return ctx.storage.outbox! as unknown as {
+		put(id: string, data: Queued): Promise<void>;
+		delete(id: string): Promise<void>;
+		query(o?: object): Promise<{ items: Array<{ id: string; data: Queued }>; cursor?: string; hasMore: boolean }>;
+	};
+}
+
 // ———————————————————————— subscriber content store —————————————————————————
 
 function contentApi(ctx: PluginContext) {
@@ -609,6 +627,31 @@ async function sendConfirmationEmail(ctx: PluginContext, sub: SubscriberData): P
 }
 
 // ————————————————————————————— blast processing ————————————————————————————
+
+/**
+ * Drain one-off transactional mail. Separate from the blast queue: these have no
+ * blast to report against, and a permanently failing message is dropped after
+ * three attempts rather than retried for ever.
+ */
+async function processOutbox(ctx: PluginContext): Promise<void> {
+	if (!ctx.email) return;
+	const pending = await outbox(ctx).query({ limit: 25 });
+	for (const item of pending.items) {
+		const d = item.data;
+		try {
+			await ctx.email.send({ to: d.to, subject: d.subject, text: d.text, html: d.html });
+			await outbox(ctx).delete(item.id);
+		} catch (error) {
+			const attempts = (d.attempts ?? 0) + 1;
+			if (attempts >= 3) {
+				ctx.log.error(`Giving up on queued mail to ${d.to} after 3 attempts`, error);
+				await outbox(ctx).delete(item.id);
+			} else {
+				await outbox(ctx).put(item.id, { ...d, attempts });
+			}
+		}
+	}
+}
 
 async function processQueue(ctx: PluginContext): Promise<void> {
 	const batchSize = (await ctx.kv.get<number>("settings:batchSize")) ?? 25;
@@ -1223,6 +1266,7 @@ export default definePlugin({
 			handler: async (event: { name: string }, ctx: PluginContext) => {
 				if (event.name === "process-queue") {
 					await ctx.kv.set("state:lastCron", now());
+					await processOutbox(ctx);
 					await processQueue(ctx);
 				}
 			},
@@ -1310,28 +1354,29 @@ Sent from the website contact form. Replying goes to the sender.`;
 					replyTo: email,
 				} as Parameters<NonNullable<PluginContext["email"]>["send"]>[0]);
 
-				// Acknowledge to the submitter separately, with *no* content from
-				// the submission — not the message, not the subject, not even the
-				// name. Every one of those is attacker-controlled, and this mail
-				// goes to an address nobody has verified. Fixed copy only.
-				try {
-					await ctx.email.send({
-						to: email,
-						subject: "We got your message",
-						text: `Thanks for getting in touch.
+				// Queue the submitter's acknowledgement rather than sending it here.
+				// A route has a fixed 5s budget and one Postal call can consume most
+				// of it, so a second inline send times the whole request out — which
+				// is exactly what happened when this was inline.
+				//
+				// The acknowledgement carries *no* content from the submission: not
+				// the message, subject, or name. All are attacker-controlled and this
+				// goes to an address nobody has verified.
+				await outbox(ctx).put(`ack-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`, {
+					to: email,
+					subject: "We got your message",
+					text: `Thanks for getting in touch.
 
 We've received your message and someone will reply soon.
 
 You're getting this because this address was entered into the contact form on our website. If that wasn't you, no action is needed — nothing has been signed up or changed, and we won't email you again about it.`,
-						html: `<p>Thanks for getting in touch.</p>
+					html: `<p>Thanks for getting in touch.</p>
 <p>We've received your message and someone will reply soon.</p>
 <p style="font-size:12px;color:#777">You're getting this because this address was entered into the contact form on our website. If that wasn't you, no action is needed — nothing has been signed up or changed, and we won't email you again about it.</p>`,
-					} as Parameters<NonNullable<PluginContext["email"]>["send"]>[0]);
-				} catch (error) {
-					// The operator's copy already went out; a failed acknowledgement
-					// must not make the submitter think the form is broken.
-					ctx.log.error("Contact acknowledgement failed", error);
-				}
+					createdAt: now(),
+					attempts: 0,
+				});
+				await ensureCron(ctx);
 
 				return { ok: true };
 			},

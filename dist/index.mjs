@@ -15,7 +15,7 @@
 function emdashMailingList() {
 	return {
 		id: "emdash-mailing-list",
-		version: "0.6.0",
+		version: "0.6.1",
 		format: "standard",
 		entrypoint: "emdash-mailing-list/sandbox",
 		options: {},
@@ -37,7 +37,8 @@ function emdashMailingList() {
 				"email",
 				"status",
 				"createdAt"
-			] }
+			] },
+			outbox: { indexes: ["createdAt"] }
 		},
 		adminPages: [{
 			path: "/mailing-list",
