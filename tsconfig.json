@@ -2,12 +2,14 @@
 	"compilerOptions": {
 		"target": "ES2022",
 		"module": "ESNext",
-		"moduleResolution": "bundler",
-		"lib": ["ES2022", "WebWorker"],
+		"moduleResolution": "Bundler",
+		"lib": ["ES2022", "DOM"],
+		"jsx": "react-jsx",
+		"types": ["node"],
 		"strict": true,
-		"noEmit": true,
 		"skipLibCheck": true,
-		"esModuleInterop": true,
+		"noEmit": true,
+		"isolatedModules": true,
 		"forceConsistentCasingInFileNames": true
 	},
 	"include": ["src"]
