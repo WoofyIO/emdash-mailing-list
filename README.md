@@ -1,6 +1,8 @@
 # emdash-mailing-list
 
-A *very* simple mailing list for [EmDash CMS](https://docs.emdashcms.com): signup with double opt-in, one-click unsubscribe, admin-composed **Markdown** blasts in a **branded HTML template**, per-blast delivery status, and automatic bounce handling via [Postal](https://postalserver.io) webhooks.
+A simple mailing list for [EmDash CMS](https://docs.emdashcms.com): signup with double opt-in, one-click unsubscribe, blasts composed in the admin's **rich-text editor** with a **live preview of the real email** in your branded HTML template, checkbox targeting across collections, per-blast delivery/open/click reporting, and automatic bounce handling via [Postal](https://postalserver.io) webhooks.
+
+Version 0.7 is a *native* EmDash plugin (React admin pages, no sandbox) — see [Upgrading from 0.6](#upgrading-from-06).
 
 Email is delivered through whatever email provider the site already has configured (e.g. [emdash-postal](https://github.com/undefined-charity/emdash-postal)) — this plugin adds the list, not the transport.
 
@@ -26,11 +28,13 @@ The **Source collections** setting takes a comma-separated list. The first is th
 - **Signup** — public JSON endpoint with an email-format check and honeypot; safe to call from any site form
 - **Double opt-in** — subscribers confirm via an emailed link before receiving blasts
 - **Unsubscribe** — tokenized one-click link appended to every blast automatically
-- **Blasts** — Markdown compose (`**bold**`, `*italic*`, `[links](…)`, `#` headings, `-` lists), `{{merge_tags}}`, queued and sent in rate-limited batches with live sent/delivered/failed/bounced counts
+- **Compose** — the same Portable Text editor as the rest of the admin: headings, lists, links, bold/italic, images from the media library, button blocks, dividers, pull quotes. `{{merge_tags}}` in subject and body. Blocks email clients can't render (columns, embeds, galleries) are dropped, never mangled.
+- **Live preview** — rendered server-side on every keystroke, as HTML (in an isolated iframe) or plain text, inside your saved template, with merge tags filled from a subscriber you pick — what you see is byte-for-byte what goes out
+- **Blasts** — queued and sent in rate-limited batches with live sent/delivered/failed/bounced counts. Markdown bodies are still accepted from scripted callers.
 - **Targeting** — **checkboxes, not syntax**: one per source collection, plus one per value of that collection's group field (set **Checkbox targeting** to e.g. `attendees:event` and every event becomes a tickbox with a recipient count). Untick a source to exclude it entirely. An **Advanced filter** box still accepts the raw `attendees: year=2026, void=false` syntax and is ANDed on top, and **Evaluate** mode shows exactly who would receive the blast (email, source, state) without sending anything.
 
   Ticking a subset of the group values ORs them, so "everyone who came to the first event but not the second" is two clicks. Filters for the same field are ORed; different fields are ANDed.
-- **HTML template** — paste your site's email shell in settings; `{{content}}` receives the rendered message (also available: `{{subject}}`, `{{unsubscribe_url}}`, `{{list_name}}`). Leave empty for a clean default.
+- **HTML template** — paste your site's email shell in settings, with a live preview of the saved template beside it; `{{content}}` receives the rendered message (also available: `{{subject}}`, `{{unsubscribe_url}}`, `{{list_name}}`). Leave empty for a clean default. Don't put `{{content}}` in an HTML comment — it's replaced everywhere it appears.
 - **Subscriber management** — per-row **Confirm / Block / Unblock / Delete** actions in the admin, plus manual add
 - **Per-blast reporting** — delivered, unique opens and clicks (with rates against delivered), failures, bounces and delayed counts, per blast in the admin. Opens and clicks are de-duplicated per recipient, and a click also counts as an open since pixel blocking is common.
 - **Bounce handling** — Postal webhook: hard bounces **block** the address (kept on the list for audit, never emailed), three soft failures do the same, `MessageSent` upgrades sends to *delivered*. Blocking is reversible with one click.
@@ -151,12 +155,21 @@ GET /_emdash/api/plugins/emdash-mailing-list/health
 - Bounce correlation is by recipient address (most recent send) — exact for single-list setups.
 - No segmentation or scheduling (yet) — it's the *very simple* mailing list.
 
+## Admin API
+
+Every admin page is backed by a route under `/_emdash/api/plugins/emdash-mailing-list/` that scripts can call with an admin session or Bearer token and the `X-EmDash-Request: 1` header: `overview`, `compose-options`, `preview`, `evaluate`, `send-test`, `send`, `blasts`, `blast`, `subscribers`, `subscriber-action`, `settings-get`, `settings-save`. `send` takes `{ subject, bodyPT? | body?, targets: { includePrimary, sources: { [collection]: { include, values? } }, advanced? } }`.
+
+## Upgrading from 0.6
+
+Storage and settings keys are unchanged, so blasts, sends, the template and the webhook secret carry over. The plugin is now shipped as source (`src/`), like the other native EmDash plugins, so it needs its peers installed in the site: `emdash`, `@emdash-cms/admin`, `@cloudflare/kumo` and `react` — all already present on any site running the EmDash admin.
+
 ## Development
 
 ```bash
 npm install
-npm run build      # tsdown → dist/ (committed, so GitHub installs need no build step)
 npm run typecheck
 ```
+
+Test it in a site with `npm pack` and `npm install ./emdash-mailing-list-<version>.tgz`.
 
 MIT © Woofy
