@@ -223,6 +223,16 @@ export async function webhook(ctx: RouteContext<Record<string, unknown>>) {
 	return { ok: true, result };
 }
 
+/**
+ * The send-queue cron is driven by the host's scheduler — on Cloudflare a Cron
+ * Trigger, which is best-effort: ticks arriving a few minutes late (or a
+ * 5–6 minute gap) are routine and not worth a page. A late cron therefore only
+ * degrades health while sends are actually waiting on it; a cron that has been
+ * silent this long is treated as dead regardless of the queue.
+ */
+const CRON_LATE_SECONDS = 15 * 60;
+const CRON_DEAD_SECONDS = 60 * 60;
+
 /** Keyword-monitor on "healthy": only when every check passes. */
 export async function health(ctx: RouteContext) {
 	const checks: Record<string, unknown> = {};
@@ -233,8 +243,9 @@ export async function health(ctx: RouteContext) {
 	const lastCron = await ctx.kv.get<string>("state:lastCron");
 	const cronAge = lastCron ? Math.round((Date.now() - new Date(lastCron).getTime()) / 1000) : null;
 	checks.cron_age_seconds = cronAge;
-	const cronOk = cronAge !== null && cronAge < 300;
-	checks.cron = cronOk ? "beating" : "stale";
+	const cronOk = cronAge !== null && cronAge < CRON_LATE_SECONDS;
+	const cronDead = cronAge === null || cronAge >= CRON_DEAD_SECONDS;
+	checks.cron = cronOk ? "beating" : cronDead ? "dead" : "late";
 	let queueOk = true;
 	try {
 		const queued = await sendsStore(ctx).count({ status: "queued" });
@@ -244,7 +255,7 @@ export async function health(ctx: RouteContext) {
 		queueOk = false;
 		checks.queued_sends = "unknown";
 	}
-	const healthy = database && emailProvider && cronOk && queueOk;
+	const healthy = database && emailProvider && queueOk && !cronDead;
 	return { status: healthy ? "healthy" : "degraded", checks, ts: now() };
 }
 

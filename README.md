@@ -146,7 +146,7 @@ GET /_emdash/api/plugins/emdash-mailing-list/health
 → {"success":true,"data":{"status":"healthy","checks":{"database":"up","email_provider":"configured","cron_age_seconds":42,"cron":"beating","queued_sends":0}}}
 ```
 
-`status` is `"healthy"` only when every check passes (`"degraded"` otherwise, including when the cron hasn't ticked in 5 minutes — the failure mode that silently stalls blasts). Point a keyword monitor (UptimeRobot, etc.) at the URL and alert when the response **doesn't** contain `healthy`.
+`status` is `"healthy"` only when every check passes, `"degraded"` otherwise. The cron check is tolerant of scheduler jitter, because Cloudflare Cron Triggers are best-effort and a 5-minute gap is routine: `cron` reads `beating` under 15 minutes, `late` after that (degraded only while `queued_sends` > 0 — the failure mode that silently stalls blasts), and `dead` after 60 minutes (always degraded). Point a keyword monitor (UptimeRobot, etc.) at the URL and alert when the response **doesn't** contain `healthy`.
 
 ## Notes & limits
 

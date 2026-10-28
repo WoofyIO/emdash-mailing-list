@@ -1,6 +1,6 @@
 {
   "name": "emdash-mailing-list",
-  "version": "0.7.0",
+  "version": "0.7.1",
   "description": "Mailing list for EmDash CMS — double opt-in signup, rich-text blasts composed in the admin with a live preview of the real email, checkbox targeting across collections, per-blast reporting and automatic bounce handling via Postal webhooks",
   "type": "module",
   "exports": {
